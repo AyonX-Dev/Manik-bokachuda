@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # scripts/process_sitemap.py
-# Updated: only check latest N entries from sitemap (default N=5)
+# Only check latest N entries from sitemap (default N=5)
+# Writes results to /tmp/new_posts.txt as:
+# Title
+# Thumbnail
+# Playlist
+# SourceLoc
+# ---
+# And appends tracked files: sitemap_urls.txt and found_playlists.txt
 
 import sys, os, re, time, argparse
 from urllib.parse import urljoin
@@ -27,12 +34,7 @@ def fetch_text(url):
         return None
 
 def extract_loc_lastmod_pairs(xml_text):
-    """
-    Return list of (loc, lastmod_or_None) tuples.
-    Handles repeated <url> blocks; tries to read lastmod if present.
-    """
     pairs = []
-    # find <url>...</url> blocks
     for m in re.finditer(r'<url\b[^>]*>(.*?)</url>', xml_text, flags=re.IGNORECASE|re.DOTALL):
         block = m.group(1)
         loc_m = re.search(r'<loc>(.*?)</loc>', block, flags=re.IGNORECASE|re.DOTALL)
