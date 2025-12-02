@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 # scripts/process_sitemap.py
-# Purpose:
-#  - Fetch sitemap.xml
-#  - For each new <loc> (not yet tracked), fetch page (Blogger-compatible),
-#    extract Title, Thumbnail, find data-encrypted values, decode them,
-#    detect playlist URLs (m3u8/m3u/mpd/mp4/ts/etc).
-#  - Append new locs to sitemap_urls.txt and new playlists to found_playlists.txt
-#  - Write /tmp/new_posts.txt with Title, Thumbnail, Playlist blocks for workflow/telegram.
+# Updated: only check latest N entries from sitemap (default N=5)
 
 import sys, os, re, time, argparse
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime
 
 # config
 TIMEOUT = 20
@@ -31,8 +26,30 @@ def fetch_text(url):
         print(f"[!] fetch failed: {url} -> {e}")
         return None
 
-def extract_loc_from_sitemap(xml_text):
-    return re.findall(r'<loc>(.*?)</loc>', xml_text, flags=re.IGNORECASE | re.DOTALL)
+def extract_loc_lastmod_pairs(xml_text):
+    """
+    Return list of (loc, lastmod_or_None) tuples.
+    Handles repeated <url> blocks; tries to read lastmod if present.
+    """
+    pairs = []
+    # find <url>...</url> blocks
+    for m in re.finditer(r'<url\b[^>]*>(.*?)</url>', xml_text, flags=re.IGNORECASE|re.DOTALL):
+        block = m.group(1)
+        loc_m = re.search(r'<loc>(.*?)</loc>', block, flags=re.IGNORECASE|re.DOTALL)
+        last_m = re.search(r'<lastmod>(.*?)</lastmod>', block, flags=re.IGNORECASE|re.DOTALL)
+        if loc_m:
+            loc = loc_m.group(1).strip()
+            last = last_m.group(1).strip() if last_m else None
+            dt = None
+            if last:
+                for fmt in ("%Y-%m-%dT%H:%M:%SZ","%Y-%m-%dT%H:%M:%S%z","%Y-%m-%d"):
+                    try:
+                        dt = datetime.strptime(last, fmt)
+                        break
+                    except:
+                        dt = None
+            pairs.append((loc, dt))
+    return pairs
 
 def read_tracked(path):
     s = set()
@@ -108,7 +125,6 @@ def extract_thumbnail(html, page_url=None):
     return "No Thumbnail"
 
 def extract_data_encrypted(html):
-    # common attribute
     arr = re.findall(r'data-encrypted=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
     return arr
 
@@ -141,12 +157,14 @@ def main():
     p.add_argument('--tracked-file', default='sitemap_urls.txt')
     p.add_argument('--playlists-file', default='found_playlists.txt')
     p.add_argument('--out', default=TMP_OUT)
+    p.add_argument('--max-check', type=int, default=5, help='How many latest sitemap entries to check (default 5)')
     args = p.parse_args()
 
     sitemap_url = args.sitemap
     tracked_file = args.tracked_file
     playlists_file = args.playlists_file
     out_file = args.out
+    max_check = args.max_check
 
     print("[*] fetching sitemap:", sitemap_url)
     sitemap_text = fetch_text(sitemap_url)
@@ -154,12 +172,20 @@ def main():
         print("[!] cannot fetch sitemap")
         sys.exit(1)
 
-    locs = extract_loc_from_sitemap(sitemap_text)
-    print(f"[*] sitemap contains {len(locs)} loc entries")
+    pairs = extract_loc_lastmod_pairs(sitemap_text)
+    if not pairs:
+        print("[!] no <url> entries found in sitemap")
+        sys.exit(0)
+
+    indexed = [(i, loc, dt) for i, (loc, dt) in enumerate(pairs)]
+    indexed.sort(key=lambda x: (x[2] is not None, x[2] if x[2] is not None else datetime.min), reverse=True)
+    top_n = indexed[:max_check]
+    locs_to_consider = [loc for (_, loc, _) in top_n]
+    print(f"[*] total sitemap entries: {len(pairs)}; considering top {len(locs_to_consider)} entries")
 
     tracked = read_tracked(tracked_file)
-    new_locs = [l for l in locs if l not in tracked]
-    print(f"[*] new locs to check: {len(new_locs)}")
+    new_locs = [l for l in locs_to_consider if l not in tracked]
+    print(f"[*] among top {len(locs_to_consider)}, new (not tracked) count: {len(new_locs)}")
 
     found_posts = []
     found_playlists = []
@@ -174,7 +200,6 @@ def main():
         title = extract_title(html, loc)
         thumb = extract_thumbnail(html, loc)
 
-        # 1) decode data-encrypted values
         encs = extract_data_encrypted(html)
         decoded_texts = []
         for e in encs:
@@ -182,14 +207,11 @@ def main():
             if d:
                 decoded_texts.append(d)
 
-        # 2) find playlists in decoded texts first
         playlist_urls = []
         for dt in decoded_texts:
             playlist_urls += find_playlists(dt)
 
-        # 3) fallback scan page html itself
         playlist_urls += find_playlists(html)
-        # unique preserve order
         seen = set()
         playlist_urls = [x for x in playlist_urls if not (x in seen or seen.add(x))]
 
@@ -203,7 +225,6 @@ def main():
 
         time.sleep(0.6)
 
-    # write results to tmp out for the workflow
     if found_posts:
         with open(out_file, 'w', encoding='utf-8') as f:
             for p in found_posts:
@@ -212,16 +233,10 @@ def main():
                 f.write(p['playlist'] + "\n")
                 f.write(p['loc'] + "\n")
                 f.write("---\n")
-
-        # append playlists to playlists_file (tracked)
         append_tracked(playlists_file, found_playlists)
-
-        # append processed locs to sitemap tracked file
         append_tracked(tracked_file, [p['loc'] for p in found_posts])
-
         print("[*] wrote", len(found_posts), "new posts to", out_file)
     else:
-        # remove out file if exists
         if os.path.exists(out_file):
             try: os.remove(out_file)
             except: pass
