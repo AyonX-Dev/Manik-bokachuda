@@ -1,8 +1,8 @@
-name: Sitemap → Decode → GitHub + Telegram (JSON-based, dedupe & flock-safe)
+name: Sitemap → Decode → GitHub + Telegram (no-pending, dedupe & flock-safe)
 
 on:
   schedule:
-    - cron: '0 1 * * *'    # daily 01:00 UTC (change if needed)
+    - cron: '0 1 * * *'    # daily 01:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -51,7 +51,6 @@ jobs:
           python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
           ls -l /tmp/new_posts.txt || true
           sed -n '1,200p' /tmp/new_posts.txt || true
-          # decoded_results.json is produced by the script when new posts exist
           ls -l /tmp/decoded_results.json || true
           jq -C . /tmp/decoded_results.json 2>/dev/null || true
         shell: bash
@@ -89,11 +88,9 @@ jobs:
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           UFILE="/tmp/updates.json"
           CHATFILE="chat_ids.txt"
-          NEWIDS="/tmp/new_chat_ids.txt"
 
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
           jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true
-          : > ${NEWIDS}
 
           while IFS= read -r id; do
             [ -z "$id" ] && continue
@@ -101,7 +98,6 @@ jobs:
               echo "exists: $id"
             else
               echo "$id" >> "${CHATFILE}"
-              echo "$id" >> ${NEWIDS}
               echo "added new chat id: $id"
             fi
           done < /tmp/ids_found.txt
@@ -125,68 +121,7 @@ jobs:
           fi
         shell: bash
 
-      - name: Send pending posts to NEW chat IDs (from JSON, flock-safe)
-        run: |
-          set -e
-          TOKEN="${TELEGRAM_BOT_TOKEN}"
-          NEWIDS="/tmp/new_chat_ids.txt"
-          JSON="/tmp/decoded_results.json"
-          SENTLOG="sent_log.txt"
-          LOCK="/tmp/sent_log.lock"
-
-          is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
-
-          if [ ! -s "${NEWIDS}" ]; then
-            echo "No newly added chat ids."
-            exit 0
-          fi
-          if [ ! -s "${JSON}" ]; then
-            echo "No JSON results to send to new ids."
-            exit 0
-          fi
-
-          jq -c '.[]' "${JSON}" | while read -r item; do
-            title=$(jq -r '.title // ""'   <<<"$item")
-            thumb=$(jq -r '.thumbnail // ""'<<<"$item")
-            link=$(jq -r '.playlist // ""'  <<<"$item")
-            loc=$(jq -r '.loc // ""'        <<<"$item")
-            postid="${link}"
-            CAPTION=$(printf "%s\n%s" "$title" "$link")
-
-            while IFS= read -r newcid; do
-              [ -z "$newcid" ] && continue
-
-              (
-                flock -x 200
-
-                if grep -Fqx "${newcid}|${postid}" "${SENTLOG}"; then
-                  echo "Already sent to ${newcid} -> ${postid}, skipping"
-                  exit 0
-                fi
-
-                if [ -n "$thumb" ] && is_valid_url "$thumb"; then
-                  resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                    -d chat_id="${newcid}" \
-                    --data-urlencode "photo=${thumb}" \
-                    --data-urlencode "caption=${CAPTION}")
-                else
-                  resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                    -d chat_id="${newcid}" \
-                    --data-urlencode "text=${CAPTION}")
-                fi
-
-                echo "${resp}" > /tmp/last_send_resp.json
-                echo "${newcid}|${postid}" >> "${SENTLOG}"
-
-              ) 200>"${LOCK}"
-
-              sleep 0.6
-            done < "${NEWIDS}"
-
-          done
-        shell: bash
-
-      - name: Broadcast decoded posts to all chat IDs (from JSON, flock-safe)
+      - name: Broadcast decoded posts to all chat IDs (from JSON, flock-safe, no pending)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
