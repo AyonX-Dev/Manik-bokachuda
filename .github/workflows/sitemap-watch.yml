@@ -77,48 +77,135 @@ jobs:
           fi
           cat /tmp/commit_decoded_result.txt
 
-      - name: Auto-capture chat IDs from getUpdates
+      - name: Auto-capture chat IDs from getUpdates & send pending to new IDs
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           UFILE="/tmp/updates.json"
-          OUT="chat_ids.txt"
-          # fetch bot updates (webhook must be deleted or not active)
+          CHATFILE="chat_ids.txt"
+          NEWIDS="/tmp/new_chat_ids.txt"
+          PENDING="/tmp/new_posts.txt"
+
+          # fetch updates
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
-          # extract chat ids
+
+          # extract chat ids found in updates (unique)
           jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true
 
-          echo "found ids:"
-          cat /tmp/ids_found.txt || true
+          # prepare new ids file
+          : > ${NEWIDS}
 
-          # append unique ids into chat_ids.txt
+          # append unique ids into chat_ids.txt and record which are newly added
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            # skip comment lines in file
-            if grep -Fxq "$id" ${OUT}; then
+            # skip comment lines in file by design
+            if grep -Fxq "$id" "${CHATFILE}"; then
               echo "exists: $id"
             else
-              echo "$id" >> ${OUT}
-              echo "added: $id"
+              echo "$id" >> "${CHATFILE}"
+              echo "$id" >> ${NEWIDS}
+              echo "added new chat id: $id"
             fi
           done < /tmp/ids_found.txt
 
-          # commit if changed
-          git add chat_ids.txt || true
+          # commit chat_ids.txt if changed
+          git add "${CHATFILE}" || true
           if git diff --staged --quiet; then
             echo "chat ids unchanged"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "chore: update chat_ids (auto)"
+            git commit -m "chore: update chat_ids (auto)" || true
             if [ -n "${PUSH_TOKEN}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
-              git push origin HEAD
+              git push origin HEAD || true
             else
-              git push origin HEAD
+              git push origin HEAD || true
             fi
           fi
 
+          # If there are newly added chat ids and there are pending posts, send pending posts only to new ids
+          if [ -s "${NEWIDS}" ] && [ -s "${PENDING}" ]; then
+            echo "Sending pending posts to newly added chat ids..."
+            # helper to send one post block to a single cid
+            send_post_to_cid() {
+              local cid="$1"
+              local title="$2"
+              local thumb="$3"
+              local link="$4"
+              local loc="$5"
+
+              # build caption (real newline)
+              CAPTION=$(printf "%s\n%s" "$title" "$link")
+
+              # if thumbnail is valid URL, try sendPhoto; else sendMessage
+              if printf '%s' "$thumb" | grep -E -q '^https?://'; then
+                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                  -d chat_id="$cid" \
+                  --data-urlencode "photo=${thumb}" \
+                  --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
+              else
+                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                  -d chat_id="$cid" \
+                  --data-urlencode "text=${CAPTION}" > /tmp/tresp.json
+              fi
+              jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
+            }
+
+            # iterate over new ids and send all pending posts to them
+            while IFS= read -r newcid; do
+              [ -z "$newcid" ] && continue
+              # iterate posts in PENDING
+              while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
+                send_post_to_cid "$newcid" "$title" "$thumb" "$link" "$loc"
+                sleep 0.9
+              done < "${PENDING}"
+            done < "${NEWIDS}"
+          else
+            echo "No newly added chat ids or no pending posts to send to new ids."
+          fi
+
+      - name: Broadcast decoded posts to all chat IDs (photo + caption, real newline)
+        run: |
+          set -e
+          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          CHATFILE="chat_ids.txt"
+          NEWFILE="/tmp/new_posts.txt"
+
+          is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
+
+          if [ ! -s "${NEWFILE}" ]; then
+            echo "No new posts to broadcast to all."
+            exit 0
+          fi
+
+          # iterate each post block: title, thumb, link, loc, ---
+          while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
+            CAPTION=$(printf "%s\n%s" "$title" "$link")
+
+            # broadcast to every chat id in chat_ids.txt
+            while IFS= read -r cid; do
+              case "$cid" in
+                \#*|"") continue ;; # skip comments/empty
+              esac
+
+              echo "Broadcasting to $cid ..."
+              if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
+                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                  -d chat_id="$cid" \
+                  --data-urlencode "photo=${thumb}" \
+                  --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
+              else
+                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                  -d chat_id="$cid" \
+                  --data-urlencode "text=${CAPTION}" > /tmp/tresp.json
+              fi
+
+              jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
+              sleep 0.9
+            done < "${CHATFILE}"
+
+          done < "${NEWFILE}"
       - name: Broadcast decoded posts to all chat IDs (photo + caption, real newline)
         run: |
           set -e
