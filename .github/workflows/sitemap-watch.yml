@@ -1,4 +1,4 @@
-name: Sitemap → Decode → GitHub + Telegram (no-duplicate sends)
+name: Sitemap → Decode → GitHub + Telegram (no-duplicate sends, flock-safe)
 
 on:
   schedule:
@@ -115,13 +115,14 @@ jobs:
             fi
           fi
 
-      - name: Send pending posts to NEW chat IDs only (no duplicates)
+      - name: Send pending posts to NEW chat IDs only (no duplicates, flock)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           NEWIDS="/tmp/new_chat_ids.txt"
           PENDING="/tmp/new_posts.txt"
           SENTLOG="sent_log.txt"
+          LOCK="/tmp/sent_log.lock"
 
           is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
 
@@ -134,32 +135,49 @@ jobs:
             exit 0
           fi
 
-          # read each new id, send each pending post if not already logged
+          # send posts to new ids, using flock to avoid races when writing sent_log
           while IFS= read -r newcid; do
             [ -z "$newcid" ] && continue
             while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
               postid="${link}"
-              grep -Fqx "${newcid}|${postid}" "${SENTLOG}" || {
-                CAPTION=$(printf "%s\n%s" "$title" "$link")
-                if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
-                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                    -d chat_id="$newcid" \
-                    --data-urlencode "photo=${thumb}" \
-                    --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
-                else
-                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                    -d chat_id="$newcid" \
-                    --data-urlencode "text=${CAPTION}" > /tmp/tresp.json
+              CAPTION=$(printf "%s\n%s" "$title" "$link")
+
+              # check+append inside flock to be atomic
+              (
+                flock -x 200
+
+                # check if already logged
+                if grep -Fqx "${newcid}|${postid}" "${SENTLOG}"; then
+                  echo "Already sent to ${newcid} -> ${postid}, skipping"
+                  exit 0
                 fi
-                jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
-                # log sent
+
+                # send message (outside flock we could send; but to minimize race we send inside then log)
+                if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
+                  resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                    -d chat_id="${newcid}" \
+                    --data-urlencode "photo=${thumb}" \
+                    --data-urlencode "caption=${CAPTION}")
+                else
+                  resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                    -d chat_id="${newcid}" \
+                    --data-urlencode "text=${CAPTION}")
+                fi
+
+                # log the response briefly to aid debugging
+                echo "${resp}" > /tmp/last_send_resp.json
+
+                # append log (even if resp failed we append to avoid retries flooding)
                 echo "${newcid}|${postid}" >> "${SENTLOG}"
-                sleep 0.9
-              }
+
+              ) 200>"${LOCK}"
+
+              # small pause between sends to avoid rate-limits
+              sleep 0.9
             done < "${PENDING}"
           done < "${NEWIDS}"
 
-          # commit sent_log updates (if any)
+          # commit sent_log updates if any
           git add "${SENTLOG}" || true
           if git diff --staged --quiet; then
             echo "no new sent log entries"
@@ -175,13 +193,14 @@ jobs:
             fi
           fi
 
-      - name: Broadcast decoded posts to all chat IDs (no-duplicate per chat)
+      - name: Broadcast decoded posts to all chat IDs (no-duplicate per chat, flock)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           CHATFILE="chat_ids.txt"
           NEWFILE="/tmp/new_posts.txt"
           SENTLOG="sent_log.txt"
+          LOCK="/tmp/sent_log.lock"
 
           is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
 
@@ -199,29 +218,37 @@ jobs:
                 \#*|"") continue ;; 
               esac
 
-              # skip if already sent to this chat
-              if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
-                echo "Skip (already sent): ${cid} -> ${postid}"
-                continue
-              fi
+              # ensure atomic check+send+log using flock
+              (
+                flock -x 200
 
-              echo "Broadcasting to $cid: ${postid}"
-              if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
-                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                  -d chat_id="$cid" \
-                  --data-urlencode "photo=${thumb}" \
-                  --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
-              else
-                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                  -d chat_id="$cid" \
-                  --data-urlencode "text=${CAPTION}" > /tmp/tresp.json
-              fi
+                # if already sent to this chat for this post, skip
+                if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
+                  echo "Skip (already sent): ${cid} -> ${postid}"
+                  exit 0
+                fi
 
-              jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
+                # send
+                if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
+                  resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                    -d chat_id="${cid}" \
+                    --data-urlencode "photo=${thumb}" \
+                    --data-urlencode "caption=${CAPTION}")
+                else
+                  resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                    -d chat_id="${cid}" \
+                    --data-urlencode "text=${CAPTION}")
+                fi
 
-              # on success (or even failure) append log to avoid repeated retries causing duplicates;
-              # If you want to only log on ok=true, inspect /tmp/tresp.json before logging.
-              echo "${cid}|${postid}" >> "${SENTLOG}"
+                # save last response for debugging
+                echo "${resp}" > /tmp/last_send_resp.json
+
+                # append log line to avoid duplicates later
+                echo "${cid}|${postid}" >> "${SENTLOG}"
+
+              ) 200>"${LOCK}"
+
+              echo "Broadcasted to $cid: ${postid}"
               sleep 0.9
             done < "${CHATFILE}"
 
