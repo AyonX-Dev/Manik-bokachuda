@@ -1,1 +1,11 @@
 # sent log: lines of chatid|postid
+-1003269177184|https://is.gd/HHWevD.m3u
+-1003269177184|https://is.gd/7vp2sd.m3u
+-1003269177184|https://is.gd/Gwi4u2.m3u
+-1003269177184|https://is.gd/XFbdwJ.m3u
+-1003269177184|https://is.gd/wZCHyV.m3u
+-1003269177184|https://is.gd/HHWevD.m3u
+-1003269177184|https://is.gd/7vp2sd.m3u
+-1003269177184|https://is.gd/Gwi4u2.m3u
+-1003269177184|https://is.gd/XFbdwJ.m3u
+-1003269177184|https://is.gd/wZCHyV.m3u
