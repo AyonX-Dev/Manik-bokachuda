@@ -1,8 +1,8 @@
-name: Sitemap → Decode → GitHub + Telegram (send-to-all, retries, flock-safe)
+name: Sitemap → Decode → GitHub + Telegram (final, collect ALL chat ids)
 
 on:
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 1 * * *'    # daily 01:00 UTC (change if needed)
   workflow_dispatch:
 
 jobs:
@@ -82,35 +82,48 @@ jobs:
           cat /tmp/commit_decoded_result.txt
         shell: bash
 
-      - name: Auto-capture chat IDs from getUpdates (no duplicates + dedupe)
+      - name: Auto-capture chat IDs from getUpdates (collect ALL types)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
-          UFILE="/tmp/updates.json"
           CHATFILE="chat_ids.txt"
+          UFILE="/tmp/updates.json"
 
+          # Fetch all updates
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
-          jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true
 
+          # Extract ALL chat ids from all common update formats
+          jq -r '
+            .result[]? |
+            (
+              .message.chat.id?,
+              .edited_message.chat.id?,
+              .channel_post.chat.id?,
+              .edited_channel_post.chat.id?,
+              .my_chat_member.chat.id?,
+              .chat_member.chat.id?
+            )
+          ' ${UFILE} | grep -v null | sort -u > /tmp/all_ids.txt || true
+
+          # Insert new chat ids into chat_ids.txt if not exists
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            if grep -Fqx "$id" "${CHATFILE}"; then
+            if grep -Fqx "$id" "$CHATFILE"; then
               echo "exists: $id"
             else
-              echo "$id" >> "${CHATFILE}"
+              echo "$id" >> "$CHATFILE"
               echo "added new chat id: $id"
             fi
-          done < /tmp/ids_found.txt
+          done < /tmp/all_ids.txt
 
-          # dedupe chat_ids.txt (keep first occurrence)
-          awk '!seen[$0]++' "${CHATFILE}" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "${CHATFILE}"
+          # Remove duplicates and keep first occurrence
+          awk '!seen[$0]++' "$CHATFILE" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "$CHATFILE"
 
-          git add "${CHATFILE}" || true
-          if git diff --staged --quiet; then
-            echo "chat ids unchanged"
-          else
+          # Commit updated chat_ids.txt
+          git add "$CHATFILE" || true
+          if ! git diff --staged --quiet; then
             git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: update chat_ids (auto)" || true
             if [ -n "${PUSH_TOKEN}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
@@ -118,6 +131,8 @@ jobs:
             else
               git push origin HEAD || true
             fi
+          else
+            echo "chat ids unchanged"
           fi
         shell: bash
 
@@ -137,7 +152,7 @@ jobs:
             exit 0
           fi
 
-          # read all chat ids into an array to avoid race on file during loop
+          # read all chat ids into an array (ignore comments/blank)
           mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "${CHATFILE}" || true)
 
           # iterate posts
@@ -148,16 +163,14 @@ jobs:
             postid="${link}"
             CAPTION=$(printf "%s\n%s" "$title" "$link")
 
-            # for each chat id attempt send (with retries). ensure we attempt all cids.
             for cid in "${ALL_CIDS[@]}"; do
               # skip empty/comment lines
               if [[ -z "${cid}" || "${cid}" =~ ^\# ]]; then
                 continue
               fi
 
-              echo "=> Attempting send to: ${cid} (post: ${postid})"
+              echo "=> Attempt send to: ${cid} (post: ${postid})"
 
-              # attempt send with retry logic; do not exit the outer loop on failure
               attempts=0
               max_attempts=3
               success=false
@@ -165,14 +178,12 @@ jobs:
               while [ $attempts -lt $max_attempts ]; do
                 attempts=$((attempts+1))
 
-                # atomic section for check+send+log to avoid race conditions
                 (
                   flock -x 200
 
-                  # if already logged as sent, skip
+                  # if logged as sent, skip
                   if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
-                    echo "Already logged as sent, skipping: ${cid} -> ${postid}"
-                    # mark as success so we don't retry
+                    echo "Already sent (log exists): ${cid} -> ${postid}"
                     exit 0
                   fi
 
@@ -188,29 +199,23 @@ jobs:
                       --data-urlencode "text=${CAPTION}")
                   fi
 
-                  # save response for debugging
                   echo "${resp}" > /tmp/last_send_resp_${cid}.json || true
                   ok=$(jq -r '.ok // false' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "false")
                   desc=$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")
                   errcode=$(jq -r '.error_code // 0' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "0")
 
                   if [ "$ok" = "true" ] || [ "$ok" = "True" ]; then
-                    # log success and mark
                     echo "${cid}|${postid}" >> "${SENTLOG}"
                     success=true
                     echo "Send OK -> ${cid} (post: ${postid})"
                     exit 0
                   else
-                    # on non-ok, emit reason (but do not log)
                     echo "Send FAILED -> ${cid} (post: ${postid}) ; reason: ${desc} ; code: ${errcode}"
-                    # decide whether to retry based on error code
-                    # retry on rate-limit (429) or 5xx server errors (>=500)
                     if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
                       echo "Transient error, will retry (attempt ${attempts}/${max_attempts})"
-                      # release flock and allow retry after sleep
                       exit 1
                     else
-                      # permanent error, do not retry
+                      # permanent error — do not retry
                       exit 2
                     fi
                   fi
@@ -221,11 +226,9 @@ jobs:
                   success=true
                   break
                 elif [ $rc -eq 1 ]; then
-                  # transient error: backoff then retry
                   sleep $((attempts * 2))
                   continue
                 else
-                  # permanent error, break retries
                   break
                 fi
               done
@@ -234,10 +237,8 @@ jobs:
                 echo "Final: failed to send to ${cid} after ${attempts} attempts. See /tmp/last_send_resp_${cid}.json"
               fi
 
-              # short pause to avoid hitting Telegram limits
               sleep 0.6
             done
-
           done
 
           # commit sent_log updates (if any)
