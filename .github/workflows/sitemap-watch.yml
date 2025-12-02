@@ -1,38 +1,180 @@
-name: Sitemap Quick Test
+name: Sitemap → Decode → Telegram Broadcast
 
 on:
+  schedule:
+    - cron: '0 1 * * *'   # daily at 01:00 UTC
   workflow_dispatch:
 
 jobs:
-  test:
+  run:
     runs-on: ubuntu-latest
+
+    env:
+      SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+
     steps:
+      # ----------------------------------------------------
+      # CHECKOUT
+      # ----------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # ----------------------------------------------------
+      # Python Setup
+      # ----------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
           pip install requests beautifulsoup4
 
-      - name: Run sitemap processor (quick)
-        env:
-          SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
+      # ----------------------------------------------------
+      # Ensure Tracker Files Exist
+      # ----------------------------------------------------
+      - name: Ensure tracker files
         run: |
-          mkdir -p scripts || true
-          # ensure script exists in repo at scripts/process_sitemap.py
-          if [ ! -f scripts/process_sitemap.py ]; then
-            echo "ERROR: scripts/process_sitemap.py not found in repo" >&2
-            exit 2
+          [ -f sitemap_urls.txt ] || echo "# tracked sitemap urls" > sitemap_urls.txt
+          [ -f found_playlists.txt ] || echo "# playlists detected" > found_playlists.txt
+          [ -f chat_ids.txt ] || echo "# chat ids" > chat_ids.txt
+
+      # ----------------------------------------------------
+      # Run Python Sitemap Processor
+      # ----------------------------------------------------
+      - name: Process sitemap (latest 5)
+        run: |
+          python3 scripts/process_sitemap.py \
+            --sitemap "${SITEMAP_URL}" \
+            --tracked-file sitemap_urls.txt \
+            --playlists-file found_playlists.txt \
+            --out /tmp/new_posts.txt \
+            --max-check 5
+
+      # ----------------------------------------------------
+      # Commit decoded results (if any)
+      # ----------------------------------------------------
+      - name: Commit results
+        run: |
+          if [ -s /tmp/new_posts.txt ]; then
+            cp /tmp/new_posts.txt decoded_results.txt
+            git add sitemap_urls.txt found_playlists.txt decoded_results.txt
+
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+
+            git commit -m "Auto-update: new decoded playlist(s)" || true
+
+            if [ -n "${PUSH_TOKEN}" ]; then
+              git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            fi
+
+            git push || true
+          else
+            echo "No new decoded posts."
           fi
-          python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5 || true
-          echo "===== /tmp/new_posts.txt (first 200 chars) ====="
-          head -c 200 /tmp/new_posts.txt || true
-          echo
-          echo "===== full file (if small) ====="
-          sed -n '1,200p' /tmp/new_posts.txt || true
+
+      # ----------------------------------------------------
+      # Auto capture chat IDs
+      # ----------------------------------------------------
+      - name: Delete webhook + Fetch updates
+        run: |
+          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          curl -s "https://api.telegram.org/bot${TOKEN}/deleteWebhook" > /dev/null
+          curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > /tmp/updates.json
+
+      - name: Save new chat IDs
+        run: |
+          jq -r '.. | .chat? | .id? // empty' /tmp/updates.json | sort -u > /tmp/new_chat_ids.txt
+
+          while IFS= read -r id; do
+            case "$id" in ""|\#*) continue ;; esac
+            if ! grep -Fxq "$id" chat_ids.txt; then
+              echo "$id" >> chat_ids.txt
+              echo "Added new chat id: $id"
+            fi
+          done < /tmp/new_chat_ids.txt
+
+          git add chat_ids.txt
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git commit -m "Update chat_ids (auto)" || true
+
+          if [ -n "${PUSH_TOKEN}" ]; then
+            git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
+          git push || true
+
+      # ----------------------------------------------------
+      # Telegram Broadcast (Photo + Fallback)
+      # ----------------------------------------------------
+      - name: Broadcast decoded playlists
+        run: |
+          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          NEWFILE="/tmp/new_posts.txt"
+
+          escape() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+
+          if [ ! -s "$NEWFILE" ]; then
+            echo "No new posts to broadcast."
+            exit 0
+          fi
+
+          while IFS= read -r title && \
+                IFS= read -r thumb && \
+                IFS= read -r link && \
+                IFS= read -r loc && \
+                IFS= read -r sep; do
+
+              safe_title=$(escape "$title")
+              safe_link=$(escape "$link")
+              safe_loc=$(escape "$loc")
+
+              CAPTION="${safe_title}
+${safe_link}
+${safe_loc}"
+
+              TMP_IMG="/tmp/thumb_$$.jpg"
+              DL_OK=0
+
+              if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ]; then
+                if curl -fsSL --max-time 20 -o "$TMP_IMG" "$thumb"; then
+                  if [ -s "$TMP_IMG" ] && [ $(stat -c%s "$TMP_IMG") -gt 1024 ]; then
+                    DL_OK=1
+                  fi
+                fi
+              fi
+
+              while IFS= read -r cid; do
+                case "$cid" in ""|\#*) continue ;; esac
+
+                if [ "$DL_OK" -eq 1 ]; then
+                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                    -F chat_id="$cid" \
+                    -F "photo=@${TMP_IMG}" \
+                    --data-urlencode "caption=${CAPTION}" > /dev/null
+                else
+                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                    -d chat_id="$cid" \
+                    --data-urlencode "text=${CAPTION}" > /dev/null
+                fi
+
+                sleep 1
+              done < chat_ids.txt
+
+              rm -f "$TMP_IMG" || true
+
+          done < "$NEWFILE"
+
+      - name: Done
+        run: echo "Workflow completed successfully."
