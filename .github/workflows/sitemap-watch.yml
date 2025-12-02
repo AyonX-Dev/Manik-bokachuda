@@ -1,17 +1,25 @@
-name: Sitemap → Decode → GitHub + Telegram (final, collect ALL chat ids)
+name: Sitemap → Decode → GitHub + Telegram (auto-capture getUpdates URL supported)
 
 on:
   schedule:
-    - cron: '0 1 * * *'    # daily 01:00 UTC (change if needed)
+    - cron: '0 1 * * *'
   workflow_dispatch:
+
+env:
+  SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
+  # Optionally provide a full getUpdates URL here (for testing/demo).
+  # If not provided, the workflow will use TELEGRAM_BOT_TOKEN to build the API URL.
+  # Example test URL: https://api.telegram.org/bot849240:AAHkKk-mMaO_TLkF07fi1E3E/getUpdates
+  TELEGRAM_GETUPDATES_URL: ${{ secrets.TELEGRAM_GETUPDATES_URL }}
 
 jobs:
   watch:
     runs-on: ubuntu-latest
     env:
-      SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+      SITEMAP_URL: ${{ env.SITEMAP_URL }}
+      TELEGRAM_GETUPDATES_URL: ${{ env.TELEGRAM_GETUPDATES_URL }}
 
     steps:
       - name: Checkout repo
@@ -19,21 +27,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install utilities & Python
+      - name: Prepare environment
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq
           python -m pip install --upgrade pip
-        shell: bash
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install python deps
-        run: |
-          pip install requests beautifulsoup4
         shell: bash
 
       - name: Ensure tracker files exist
@@ -46,17 +44,14 @@ jobs:
           git commit -m "chore: add tracker files (init)" || true
         shell: bash
 
-      - name: Run processor (check latest 5)
+      - name: Run sitemap processor (assumes scripts/process_sitemap.py exists)
         run: |
           python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
           ls -l /tmp/new_posts.txt || true
-          sed -n '1,200p' /tmp/new_posts.txt || true
           ls -l /tmp/decoded_results.json || true
-          jq -C . /tmp/decoded_results.json 2>/dev/null || true
         shell: bash
 
       - name: Commit decoded results (if any)
-        id: commit_decoded
         run: |
           if [ -s /tmp/new_posts.txt ]; then
             cp /tmp/new_posts.txt decoded_results.txt
@@ -65,34 +60,44 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             if git diff --staged --quiet; then
-              echo "no_changes=true" > /tmp/commit_decoded_result.txt
+              echo "no_changes=true"
             else
-              git commit -m "chore: add discovered playlist posts (auto)"
+              git commit -m "chore: add discovered playlist posts (auto)" || true
               if [ -n "${PUSH_TOKEN}" ]; then
                 git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
                 git push origin HEAD || true
               else
                 git push origin HEAD || true
               fi
-              echo "no_changes=false" > /tmp/commit_decoded_result.txt
             fi
           else
-            echo "no_new_posts" > /tmp/commit_decoded_result.txt
+            echo "no_new_posts"
           fi
-          cat /tmp/commit_decoded_result.txt
         shell: bash
 
-      - name: Auto-capture chat IDs from getUpdates (collect ALL types)
+      - name: Auto-capture chat IDs from getUpdates (use provided URL if set)
+        id: capture_chats
         run: |
-          set -e
-          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          set -euo pipefail
+
           CHATFILE="chat_ids.txt"
           UFILE="/tmp/updates.json"
 
-          # Fetch all updates
-          curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
+          # decide which getUpdates URL to use:
+          if [ -n "${TELEGRAM_GETUPDATES_URL:-}" ]; then
+            GETUP_URL="${TELEGRAM_GETUPDATES_URL}"
+            echo "Using provided TELEGRAM_GETUPDATES_URL"
+          elif [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            GETUP_URL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+            echo "Using built getUpdates URL from TELEGRAM_BOT_TOKEN"
+          else
+            echo "No getUpdates URL or TELEGRAM_BOT_TOKEN available -- skipping auto-capture"
+            exit 0
+          fi
 
-          # Extract ALL chat ids from all common update formats
+          echo "Fetching updates from: ${GETUP_URL}"
+          curl -s "${GETUP_URL}" -o "${UFILE}" || true
+          # Extract all relevant chat ids from common update fields
           jq -r '
             .result[]? |
             (
@@ -103,153 +108,121 @@ jobs:
               .my_chat_member.chat.id?,
               .chat_member.chat.id?
             )
-          ' ${UFILE} | grep -v null | sort -u > /tmp/all_ids.txt || true
+          ' "${UFILE}" | grep -v null | sort -u > /tmp/all_ids.txt || true
 
-          # Insert new chat ids into chat_ids.txt if not exists
+          echo "Found ids:"
+          cat /tmp/all_ids.txt || true
+
+          # Append any new ids (exact match) to chat_ids.txt
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            if grep -Fqx "$id" "$CHATFILE"; then
+            if grep -Fqx "$id" "${CHATFILE}"; then
               echo "exists: $id"
             else
-              echo "$id" >> "$CHATFILE"
+              echo "$id" >> "${CHATFILE}"
               echo "added new chat id: $id"
             fi
           done < /tmp/all_ids.txt
 
-          # Remove duplicates and keep first occurrence
-          awk '!seen[$0]++' "$CHATFILE" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "$CHATFILE"
+          # Dedupe chat_ids.txt (keep first occurrence)
+          awk '!seen[$0]++' "${CHATFILE}" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "${CHATFILE}"
 
-          # Commit updated chat_ids.txt
-          git add "$CHATFILE" || true
-          if ! git diff --staged --quiet; then
+          # Commit updated chat_ids.txt if changed
+          git add "${CHATFILE}" || true
+          if git diff --staged --quiet; then
+            echo "chat ids unchanged"
+          else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: update chat_ids (auto)" || true
-            if [ -n "${PUSH_TOKEN}" ]; then
+            if [ -n "${PUSH_TOKEN:-}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
               git push origin HEAD || true
             else
               git push origin HEAD || true
             fi
-          else
-            echo "chat ids unchanged"
           fi
         shell: bash
 
-      - name: Broadcast decoded posts to all chat IDs (send-to-all, retries, flock-safe)
+      - name: Broadcast decoded posts to all chat IDs (simple attempt; respects sent_log)
         run: |
           set -e
-          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          TOKEN="${TELEGRAM_BOT_TOKEN:-}"
           CHATFILE="chat_ids.txt"
           JSON="/tmp/decoded_results.json"
           SENTLOG="sent_log.txt"
           LOCK="/tmp/sent_log.lock"
 
-          is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
-
+          # If no JSON, nothing to broadcast
           if [ ! -s "${JSON}" ]; then
-            echo "No JSON results to broadcast."
+            echo "No decoded_results.json, nothing to broadcast."
             exit 0
           fi
 
-          # read all chat ids into an array (ignore comments/blank)
+          # prepare list of chat ids (ignore commented/blank)
           mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "${CHATFILE}" || true)
 
-          # iterate posts
           jq -c '.[]' "${JSON}" | while read -r item; do
-            title=$(jq -r '.title // ""'   <<<"$item")
-            thumb=$(jq -r '.thumbnail // ""'<<<"$item")
-            link=$(jq -r '.playlist // ""'  <<<"$item")
+            title=$(jq -r '.title // ""' <<<"$item")
+            thumb=$(jq -r '.thumbnail // ""' <<<"$item")
+            link=$(jq -r '.playlist // ""' <<<"$item")
             postid="${link}"
             CAPTION=$(printf "%s\n%s" "$title" "$link")
 
             for cid in "${ALL_CIDS[@]}"; do
-              # skip empty/comment lines
-              if [[ -z "${cid}" || "${cid}" =~ ^\# ]]; then
-                continue
-              fi
+              if [[ -z "${cid}" || "${cid}" =~ ^\# ]]; then continue; fi
 
-              echo "=> Attempt send to: ${cid} (post: ${postid})"
+              echo "Attempt send to ${cid} -> ${postid}"
 
-              attempts=0
-              max_attempts=3
-              success=false
+              (
+                flock -x 200
 
-              while [ $attempts -lt $max_attempts ]; do
-                attempts=$((attempts+1))
-
-                (
-                  flock -x 200
-
-                  # if logged as sent, skip
-                  if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
-                    echo "Already sent (log exists): ${cid} -> ${postid}"
-                    exit 0
-                  fi
-
-                  # perform send
-                  if [ -n "$thumb" ] && is_valid_url "$thumb"; then
-                    resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                      -d chat_id="${cid}" \
-                      --data-urlencode "photo=${thumb}" \
-                      --data-urlencode "caption=${CAPTION}")
-                  else
-                    resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                      -d chat_id="${cid}" \
-                      --data-urlencode "text=${CAPTION}")
-                  fi
-
-                  echo "${resp}" > /tmp/last_send_resp_${cid}.json || true
-                  ok=$(jq -r '.ok // false' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "false")
-                  desc=$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")
-                  errcode=$(jq -r '.error_code // 0' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "0")
-
-                  if [ "$ok" = "true" ] || [ "$ok" = "True" ]; then
-                    echo "${cid}|${postid}" >> "${SENTLOG}"
-                    success=true
-                    echo "Send OK -> ${cid} (post: ${postid})"
-                    exit 0
-                  else
-                    echo "Send FAILED -> ${cid} (post: ${postid}) ; reason: ${desc} ; code: ${errcode}"
-                    if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
-                      echo "Transient error, will retry (attempt ${attempts}/${max_attempts})"
-                      exit 1
-                    else
-                      # permanent error — do not retry
-                      exit 2
-                    fi
-                  fi
-
-                ) 200>"${LOCK}"
-                rc=$?
-                if [ $rc -eq 0 ]; then
-                  success=true
-                  break
-                elif [ $rc -eq 1 ]; then
-                  sleep $((attempts * 2))
-                  continue
-                else
-                  break
+                # skip if already logged
+                if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
+                  echo "Already sent: ${cid}|${postid}"
+                  exit 0
                 fi
-              done
 
-              if [ "$success" != "true" ]; then
-                echo "Final: failed to send to ${cid} after ${attempts} attempts. See /tmp/last_send_resp_${cid}.json"
-              fi
+                # choose send method (photo or message)
+                if [ -n "$thumb" ] && printf '%s' "$thumb" | grep -qE '^https?://'; then
+                  resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+                    -d chat_id="${cid}" \
+                    --data-urlencode "photo=${thumb}" \
+                    --data-urlencode "caption=${CAPTION}")
+                else
+                  resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d chat_id="${cid}" \
+                    --data-urlencode "text=${CAPTION}")
+                fi
+
+                # Save and check response; log only on success
+                echo "${resp}" > /tmp/last_send_resp_${cid}.json || true
+                ok=$(jq -r '.ok // false' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "false")
+                if [ "$ok" = "true" ]; then
+                  echo "${cid}|${postid}" >> "${SENTLOG}"
+                  echo "Sent OK -> ${cid}"
+                else
+                  desc=$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")
+                  echo "Send failed to ${cid} : ${desc}"
+                fi
+
+              ) 200>"${LOCK}"
 
               sleep 0.6
             done
           done
+        shell: bash
 
-          # commit sent_log updates (if any)
-          git add "${SENTLOG}" || true
+      - name: Commit sent_log updates (if any)
+        run: |
+          git add sent_log.txt || true
           if git diff --staged --quiet; then
             echo "no new sent_log entries"
           else
             git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: update sent_log (auto)" || true
-            if [ -n "${PUSH_TOKEN}" ]; then
+            if [ -n "${PUSH_TOKEN:-}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
               git push origin HEAD || true
             else
@@ -258,7 +231,6 @@ jobs:
           fi
         shell: bash
 
-      - name: Final status
-        run: |
-          echo "Workflow finished."
+      - name: Done
+        run: echo "Workflow finished."
         shell: bash
