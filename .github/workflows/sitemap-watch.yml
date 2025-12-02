@@ -8,6 +8,14 @@ on:
 jobs:
   watch:
     runs-on: ubuntu-latest
+
+    # expose secrets as environment variables for shell
+    env:
+      SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -32,16 +40,15 @@ jobs:
           git commit -m "chore: add tracker files (init)" || true
 
       - name: Run processor (check latest 5)
-        env:
-          SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
         run: |
-          python3 scripts/process_sitemap.py --sitemap "$SITEMAP_URL" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
+          python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
           ls -l /tmp/new_posts.txt || true
           sed -n '1,200p' /tmp/new_posts.txt || true
 
       - name: Commit discovered files (if any)
         id: commit
         run: |
+          set -e
           if [ -s /tmp/new_posts.txt ]; then
             cp /tmp/new_posts.txt decoded_results.txt
             git add sitemap_urls.txt found_playlists.txt decoded_results.txt
@@ -51,9 +58,10 @@ jobs:
               echo "no_changes=true" > /tmp/commit_result.txt
             else
               git commit -m "chore: add discovered playlist posts (auto)"
-              # if PUSH_TOKEN secret is set, use it for push; otherwise default token used
-              if [ -n "${{ secrets.PUSH_TOKEN }}" ]; then
-                git remote set-url origin https://x-access-token:${{ secrets.PUSH_TOKEN }}@github.com/${{ github.repository }}.git
+              # use PUSH_TOKEN if provided (for protected branches)
+              if [ -n "${PUSH_TOKEN}" ]; then
+                # set remote URL with token for pushing
+                git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
                 git push origin HEAD
               else
                 git push origin HEAD
@@ -65,25 +73,37 @@ jobs:
           fi
           cat /tmp/commit_result.txt
 
-      - name: Send to Telegram
+      - name: Send to Telegram (safe HTML)
         if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          set -e
           FILE=/tmp/new_posts.txt
+
+          # helper: escape &, <, >
+          escape_html() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+
           if [ -s "$FILE" ]; then
             while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
-              MSG="<b>$(echo "$title" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')<\/b>%0A"
-              if [ "$thumb" != "No Thumbnail" ]; then
-                MSG="${MSG}Thumbnail: ${thumb}%0A"
+              safe_title=$(escape_html "$title")
+              safe_thumb=$(escape_html "$thumb")
+              safe_link=$(escape_html "$link")
+              safe_loc=$(escape_html "$loc")
+
+              # Build message with safe content; use \n for newlines and send via --data-urlencode
+              MESSAGE="<b>${safe_title}</b>\n"
+              if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ]; then
+                MESSAGE="${MESSAGE}Thumbnail: ${safe_thumb}\n"
               fi
-              MSG="${MSG}Playlist: <code>${link}</code>%0A"
-              MSG="${MSG}Source: ${loc}"
+              MESSAGE="${MESSAGE}Playlist: <code>${safe_link}</code>\n"
+              MESSAGE="${MESSAGE}Source: ${safe_loc}"
+
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                 -d chat_id="${TELEGRAM_CHAT_ID}" \
                 -d parse_mode="HTML" \
-                --data-urlencode "text=${MSG}"
+                --data-urlencode "text=${MESSAGE}"
+
               sleep 0.8
             done < "$FILE"
           else
