@@ -1,176 +1,176 @@
 name: Sitemap → Decode → GitHub + Telegram (auto chat capture & broadcast)
 
 on:
-schedule:
-- cron: '0 1 * * *'    # daily 01:00 UTC (change as needed)
-workflow_dispatch:
+  schedule:
+    - cron: '0 1 * * *'    # daily 01:00 UTC (change as needed)
+  workflow_dispatch:
 
 jobs:
-watch:
-runs-on: ubuntu-latest
-env:
-SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
-# TELEGRAM_BOT_TOKEN must be set in repo secrets
-TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-# optional: PUSH_TOKEN (PAT) if branch protection blocks GITHUB_TOKEN push
-PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
+      # TELEGRAM_BOT_TOKEN must be set in repo secrets
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      # optional: PUSH_TOKEN (PAT) if branch protection blocks GITHUB_TOKEN push
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
-steps:  
-  - name: Checkout repo  
-    uses: actions/checkout@v4  
-    with:  
-      fetch-depth: 0  
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-  - name: Setup Python + jq  
-    run: |  
-      sudo apt-get update -qq  
-      sudo apt-get install -y jq  
-      python -m pip install --upgrade pip  
-    shell: bash  
+      - name: Setup Python + jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+          python -m pip install --upgrade pip
+        shell: bash
 
-  - name: Setup Python env  
-    uses: actions/setup-python@v4  
-    with:  
-      python-version: '3.11'  
+      - name: Setup Python env
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
 
-  - name: Install python deps  
-    run: |  
-      pip install requests beautifulsoup4  
+      - name: Install python deps
+        run: |
+          pip install requests beautifulsoup4
 
-  - name: Ensure tracker files exist  
-    run: |  
-      [ -f sitemap_urls.txt ] || echo "# sitemap urls collected by actions" > sitemap_urls.txt  
-      [ -f found_playlists.txt ] || echo "# found playlist urls" > found_playlists.txt  
-      [ -f chat_ids.txt ] || echo "# chat ids collected by actions" > chat_ids.txt  
-      git add sitemap_urls.txt found_playlists.txt chat_ids.txt || true  
-      git commit -m "chore: add tracker files (init)" || true  
+      - name: Ensure tracker files exist
+        run: |
+          [ -f sitemap_urls.txt ] || echo "# sitemap urls collected by actions" > sitemap_urls.txt
+          [ -f found_playlists.txt ] || echo "# found playlist urls" > found_playlists.txt
+          [ -f chat_ids.txt ] || echo "# chat ids collected by actions" > chat_ids.txt
+          git add sitemap_urls.txt found_playlists.txt chat_ids.txt || true
+          git commit -m "chore: add tracker files (init)" || true
 
-  - name: Run processor (check latest 5)  
-    run: |  
-      python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5  
-      ls -l /tmp/new_posts.txt || true  
-      sed -n '1,200p' /tmp/new_posts.txt || true  
+      - name: Run processor (check latest 5)
+        run: |
+          python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
+          ls -l /tmp/new_posts.txt || true
+          sed -n '1,200p' /tmp/new_posts.txt || true
 
-  - name: Commit decoded results (if any)  
-    id: commit_decoded  
-    run: |  
-      if [ -s /tmp/new_posts.txt ]; then  
-        cp /tmp/new_posts.txt decoded_results.txt  
-        git add sitemap_urls.txt found_playlists.txt decoded_results.txt  
-        git config user.name "github-actions[bot]"  
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"  
-        if git diff --staged --quiet; then  
-          echo "no_changes=true" > /tmp/commit_decoded_result.txt  
-        else  
-          git commit -m "chore: add discovered playlist posts (auto)"  
-          # preference: use PUSH_TOKEN if set (for protected branches)  
-          if [ -n "${PUSH_TOKEN}" ]; then  
-            git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git  
-            git push origin HEAD  
-          else  
-            git push origin HEAD  
-          fi  
-          echo "no_changes=false" > /tmp/commit_decoded_result.txt  
-        fi  
-      else  
-        echo "no_new_posts" > /tmp/commit_decoded_result.txt  
-      fi  
-      cat /tmp/commit_decoded_result.txt  
+      - name: Commit decoded results (if any)
+        id: commit_decoded
+        run: |
+          if [ -s /tmp/new_posts.txt ]; then
+            cp /tmp/new_posts.txt decoded_results.txt
+            git add sitemap_urls.txt found_playlists.txt decoded_results.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            if git diff --staged --quiet; then
+              echo "no_changes=true" > /tmp/commit_decoded_result.txt
+            else
+              git commit -m "chore: add discovered playlist posts (auto)"
+              # preference: use PUSH_TOKEN if set (for protected branches)
+              if [ -n "${PUSH_TOKEN}" ]; then
+                git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+                git push origin HEAD
+              else
+                git push origin HEAD
+              fi
+              echo "no_changes=false" > /tmp/commit_decoded_result.txt
+            fi
+          else
+            echo "no_new_posts" > /tmp/commit_decoded_result.txt
+          fi
+          cat /tmp/commit_decoded_result.txt
 
-  - name: Auto-capture chat IDs from getUpdates  
-    run: |  
-      set -e  
-      TOKEN="${TELEGRAM_BOT_TOKEN}"  
-      UFILE="/tmp/updates.json"  
-      OUT="chat_ids.txt"  
-      # fetch bot updates (webhook must be deleted or not active)  
-      curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true  
-      # extract chat ids  
-      jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true  
+      - name: Auto-capture chat IDs from getUpdates
+        run: |
+          set -e
+          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          UFILE="/tmp/updates.json"
+          OUT="chat_ids.txt"
+          # fetch bot updates (webhook must be deleted or not active)
+          curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
+          # extract chat ids
+          jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true
 
-      echo "found ids:"  
-      cat /tmp/ids_found.txt || true  
+          echo "found ids:"
+          cat /tmp/ids_found.txt || true
 
-      # append unique ids into chat_ids.txt  
-      while IFS= read -r id; do  
-        [ -z "$id" ] && continue  
-        # skip comment lines in file  
-        if grep -Fxq "$id" ${OUT}; then  
-          echo "exists: $id"  
-        else  
-          echo "$id" >> ${OUT}  
-          echo "added: $id"  
-        fi  
-      done < /tmp/ids_found.txt  
+          # append unique ids into chat_ids.txt
+          while IFS= read -r id; do
+            [ -z "$id" ] && continue
+            # skip comment lines in file
+            if grep -Fxq "$id" ${OUT}; then
+              echo "exists: $id"
+            else
+              echo "$id" >> ${OUT}
+              echo "added: $id"
+            fi
+          done < /tmp/ids_found.txt
 
-      # commit if changed  
-      git add chat_ids.txt || true  
-      if git diff --staged --quiet; then  
-        echo "chat ids unchanged"  
-      else  
-        git config user.name "github-actions[bot]"  
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"  
-        git commit -m "chore: update chat_ids (auto)"  
-        if [ -n "${PUSH_TOKEN}" ]; then  
-          git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git  
-          git push origin HEAD  
-        else  
-          git push origin HEAD  
-        fi  
-      fi  
+          # commit if changed
+          git add chat_ids.txt || true
+          if git diff --staged --quiet; then
+            echo "chat ids unchanged"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update chat_ids (auto)"
+            if [ -n "${PUSH_TOKEN}" ]; then
+              git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+              git push origin HEAD
+            else
+              git push origin HEAD
+            fi
+          fi
 
-  - name: Broadcast decoded posts to all chat IDs (if any)  
-    run: |  
-      set -e  
-      TOKEN="${TELEGRAM_BOT_TOKEN}"  
-      CHATFILE="chat_ids.txt"  
-      NEWFILE="/tmp/new_posts.txt"  
+      - name: Broadcast decoded posts to all chat IDs (if any)
+        run: |
+          set -e
+          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          CHATFILE="chat_ids.txt"
+          NEWFILE="/tmp/new_posts.txt"
 
-      # helper: escape &, <, >  
-      escape_html() {  
-        printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'  
-      }  
+          # helper: escape &, <, >
+          escape_html() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
 
-      if [ ! -s "${NEWFILE}" ]; then  
-        echo "No new posts to broadcast."  
-        exit 0  
-      fi  
+          if [ ! -s "${NEWFILE}" ]; then
+            echo "No new posts to broadcast."
+            exit 0
+          fi
 
-      # iterate over posts in NEWFILE  
-      # each post block: title, thumb, link, loc, ---  
-      while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do  
-        safe_title=$(escape_html "$title")  
-        safe_thumb=$(escape_html "$thumb")  
-        safe_link=$(escape_html "$link")  
-        safe_loc=$(escape_html "$loc")  
+          # iterate over posts in NEWFILE
+          # each post block: title, thumb, link, loc, ---
+          while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
+            safe_title=$(escape_html "$title")
+            safe_thumb=$(escape_html "$thumb")
+            safe_link=$(escape_html "$link")
+            safe_loc=$(escape_html "$loc")
 
-        # build message  
-        MSG="<b>${safe_title}</b>\n"  
-        if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ]; then  
-          MSG="${MSG}Thumbnail: ${safe_thumb}\n"  
-        fi  
-        MSG="${MSG}Playlist: <code>${safe_link}</code>\n"  
-        MSG="${MSG}Source: ${safe_loc}"  
+            # build message
+            MSG="<b>${safe_title}</b>\n"
+            if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ]; then
+              MSG="${MSG}Thumbnail: ${safe_thumb}\n"
+            fi
+            MSG="${MSG}Playlist: <code>${safe_link}</code>\n"
+            MSG="${MSG}Source: ${safe_loc}"
 
-        # broadcast to every chat id in chat_ids.txt  
-        while IFS= read -r cid; do  
-          case "$cid" in  
-            \#*|"") continue ;; # skip comments/empty  
-          esac  
+            # broadcast to every chat id in chat_ids.txt
+            while IFS= read -r cid; do
+              case "$cid" in
+                \#*|"") continue ;; # skip comments/empty
+              esac
 
-          echo "Sending to $cid ..."  
-          # sendMessage with HTML parse_mode, URL-encode text  
-          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \  
-            -d chat_id="$cid" \  
-            -d parse_mode="HTML" \  
-            --data-urlencode "text=${MSG}" > /tmp/tresp.json  
+              echo "Sending to $cid ..."
+              # sendMessage with HTML parse_mode, URL-encode text
+              curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                -d chat_id="$cid" \
+                -d parse_mode="HTML" \
+                --data-urlencode "text=${MSG}" > /tmp/tresp.json
 
-          jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true  
-          sleep 0.9  
-        done < "${CHATFILE}"  
+              jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
+              sleep 0.9
+            done < "${CHATFILE}"
 
-      done < "${NEWFILE}"  
+          done < "${NEWFILE}"
 
-  - name: Final status  
-    run: |  
-      echo "Workflow finished."
+      - name: Final status
+        run: |
+          echo "Workflow finished."
