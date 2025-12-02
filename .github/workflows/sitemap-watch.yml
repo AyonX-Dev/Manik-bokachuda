@@ -1,8 +1,8 @@
-name: Sitemap → Decode → GitHub + Telegram (no-duplicate sends, flock-safe)
+name: Sitemap → Decode → GitHub + Telegram (final, dedupe & flock-safe)
 
 on:
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 1 * * *'    # daily 01:00 UTC (change as needed)
   workflow_dispatch:
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup tools
+      - name: Install utilities & Python
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq
@@ -34,6 +34,7 @@ jobs:
       - name: Install python deps
         run: |
           pip install requests beautifulsoup4
+        shell: bash
 
       - name: Ensure tracker files exist
         run: |
@@ -43,12 +44,14 @@ jobs:
           [ -f sent_log.txt ] || echo "# sent log: lines of chatid|postid" > sent_log.txt
           git add sitemap_urls.txt found_playlists.txt chat_ids.txt sent_log.txt || true
           git commit -m "chore: add tracker files (init)" || true
+        shell: bash
 
       - name: Run processor (check latest 5)
         run: |
           python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
           ls -l /tmp/new_posts.txt || true
           sed -n '1,200p' /tmp/new_posts.txt || true
+        shell: bash
 
       - name: Commit decoded results (if any)
         id: commit_decoded
@@ -64,9 +67,9 @@ jobs:
               git commit -m "chore: add discovered playlist posts (auto)"
               if [ -n "${PUSH_TOKEN}" ]; then
                 git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
-                git push origin HEAD
+                git push origin HEAD || true
               else
-                git push origin HEAD
+                git push origin HEAD || true
               fi
               echo "no_changes=false" > /tmp/commit_decoded_result.txt
             fi
@@ -74,8 +77,9 @@ jobs:
             echo "no_new_posts" > /tmp/commit_decoded_result.txt
           fi
           cat /tmp/commit_decoded_result.txt
+        shell: bash
 
-      - name: Auto-capture chat IDs from getUpdates & mark new IDs
+      - name: Auto-capture chat IDs from getUpdates (no duplicates + dedupe)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
@@ -83,14 +87,17 @@ jobs:
           CHATFILE="chat_ids.txt"
           NEWIDS="/tmp/new_chat_ids.txt"
 
+          # fetch updates (make sure webhook deleted if using getUpdates)
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
 
+          # extract chat ids (unique set)
           jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true
           : > ${NEWIDS}
 
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            if grep -Fxq "$id" "${CHATFILE}"; then
+            # exact-match check; if exists, skip; else append
+            if grep -Fqx "$id" "${CHATFILE}"; then
               echo "exists: $id"
             else
               echo "$id" >> "${CHATFILE}"
@@ -98,6 +105,9 @@ jobs:
               echo "added new chat id: $id"
             fi
           done < /tmp/ids_found.txt
+
+          # ensure chat_ids.txt unique (keep first occurrence)
+          awk '!seen[$0]++' "${CHATFILE}" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "${CHATFILE}"
 
           # commit chat_ids.txt if changed
           git add "${CHATFILE}" || true
@@ -114,8 +124,9 @@ jobs:
               git push origin HEAD || true
             fi
           fi
+        shell: bash
 
-      - name: Send pending posts to NEW chat IDs only (no duplicates, flock)
+      - name: Send pending posts to NEW chat IDs only (no duplicates, flock-safe)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
@@ -135,24 +146,22 @@ jobs:
             exit 0
           fi
 
-          # send posts to new ids, using flock to avoid races when writing sent_log
           while IFS= read -r newcid; do
             [ -z "$newcid" ] && continue
             while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
               postid="${link}"
               CAPTION=$(printf "%s\n%s" "$title" "$link")
 
-              # check+append inside flock to be atomic
               (
                 flock -x 200
 
-                # check if already logged
+                # skip if already logged
                 if grep -Fqx "${newcid}|${postid}" "${SENTLOG}"; then
                   echo "Already sent to ${newcid} -> ${postid}, skipping"
                   exit 0
                 fi
 
-                # send message (outside flock we could send; but to minimize race we send inside then log)
+                # send (photo if valid thumb)
                 if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
                   resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                     -d chat_id="${newcid}" \
@@ -164,20 +173,19 @@ jobs:
                     --data-urlencode "text=${CAPTION}")
                 fi
 
-                # log the response briefly to aid debugging
+                # record last response for debugging
                 echo "${resp}" > /tmp/last_send_resp.json
 
-                # append log (even if resp failed we append to avoid retries flooding)
+                # append to sent_log (prevents duplicates)
                 echo "${newcid}|${postid}" >> "${SENTLOG}"
 
               ) 200>"${LOCK}"
 
-              # small pause between sends to avoid rate-limits
               sleep 0.9
             done < "${PENDING}"
           done < "${NEWIDS}"
 
-          # commit sent_log updates if any
+          # commit sent_log updates (if any)
           git add "${SENTLOG}" || true
           if git diff --staged --quiet; then
             echo "no new sent log entries"
@@ -192,8 +200,9 @@ jobs:
               git push origin HEAD || true
             fi
           fi
+        shell: bash
 
-      - name: Broadcast decoded posts to all chat IDs (no-duplicate per chat, flock)
+      - name: Broadcast decoded posts to all chat IDs (no-duplicate per chat, flock-safe)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
@@ -218,17 +227,14 @@ jobs:
                 \#*|"") continue ;; 
               esac
 
-              # ensure atomic check+send+log using flock
               (
                 flock -x 200
 
-                # if already sent to this chat for this post, skip
                 if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
                   echo "Skip (already sent): ${cid} -> ${postid}"
                   exit 0
                 fi
 
-                # send
                 if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
                   resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                     -d chat_id="${cid}" \
@@ -240,10 +246,7 @@ jobs:
                     --data-urlencode "text=${CAPTION}")
                 fi
 
-                # save last response for debugging
                 echo "${resp}" > /tmp/last_send_resp.json
-
-                # append log line to avoid duplicates later
                 echo "${cid}|${postid}" >> "${SENTLOG}"
 
               ) 200>"${LOCK}"
@@ -269,7 +272,9 @@ jobs:
               git push origin HEAD || true
             fi
           fi
+        shell: bash
 
       - name: Final status
         run: |
           echo "Workflow finished."
+        shell: bash
