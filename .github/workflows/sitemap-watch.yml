@@ -1,180 +1,149 @@
-name: Sitemap → Decode → Telegram Broadcast
+name: Sitemap → Decode → Telegram Broadcast (compact)
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # daily at 01:00 UTC
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    env:
-      SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
-
     steps:
-      # ----------------------------------------------------
-      # CHECKOUT
-      # ----------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ----------------------------------------------------
-      # Python Setup
-      # ----------------------------------------------------
-      - name: Setup Python
+      - name: Setup Python + deps
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
           sudo apt-get update -qq
           sudo apt-get install -y jq
-          pip install requests beautifulsoup4
 
-      # ----------------------------------------------------
-      # Ensure Tracker Files Exist
-      # ----------------------------------------------------
       - name: Ensure tracker files
         run: |
-          [ -f sitemap_urls.txt ] || echo "# tracked sitemap urls" > sitemap_urls.txt
-          [ -f found_playlists.txt ] || echo "# playlists detected" > found_playlists.txt
+          [ -f sitemap_urls.txt ] || echo "# sitemap urls" > sitemap_urls.txt
+          [ -f found_playlists.txt ] || echo "# playlists" > found_playlists.txt
           [ -f chat_ids.txt ] || echo "# chat ids" > chat_ids.txt
+          git add sitemap_urls.txt found_playlists.txt chat_ids.txt || true
 
-      # ----------------------------------------------------
-      # Run Python Sitemap Processor
-      # ----------------------------------------------------
-      - name: Process sitemap (latest 5)
+      - name: Run sitemap processor (latest 5)
+        env:
+          SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
         run: |
-          python3 scripts/process_sitemap.py \
-            --sitemap "${SITEMAP_URL}" \
-            --tracked-file sitemap_urls.txt \
-            --playlists-file found_playlists.txt \
-            --out /tmp/new_posts.txt \
-            --max-check 5
+          if [ ! -f scripts/process_sitemap.py ]; then
+            echo "ERROR: scripts/process_sitemap.py missing" >&2
+            exit 2
+          fi
+          python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5 || true
+          echo "----- /tmp/new_posts.txt -----"
+          sed -n '1,200p' /tmp/new_posts.txt || true
 
-      # ----------------------------------------------------
-      # Commit decoded results (if any)
-      # ----------------------------------------------------
-      - name: Commit results
+      - name: Commit decoded results (if any) and push
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
           if [ -s /tmp/new_posts.txt ]; then
             cp /tmp/new_posts.txt decoded_results.txt
             git add sitemap_urls.txt found_playlists.txt decoded_results.txt
-
             git config user.name "github-actions"
             git config user.email "actions@github.com"
-
-            git commit -m "Auto-update: new decoded playlist(s)" || true
-
+            git commit -m "Auto: add decoded playlist(s)" || true
             if [ -n "${PUSH_TOKEN}" ]; then
               git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             fi
-
             git push || true
           else
             echo "No new decoded posts."
           fi
 
-      # ----------------------------------------------------
-      # Auto capture chat IDs
-      # ----------------------------------------------------
-      - name: Delete webhook + Fetch updates
+      - name: Delete webhook (safe) and getUpdates
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           TOKEN="${TELEGRAM_BOT_TOKEN}"
-          curl -s "https://api.telegram.org/bot${TOKEN}/deleteWebhook" > /dev/null
-          curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > /tmp/updates.json
+          curl -s "https://api.telegram.org/bot${TOKEN}/deleteWebhook" > /dev/null || true
+          curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > /tmp/updates.json || true
+          jq -r '.. | .chat? | .id? // empty' /tmp/updates.json | sort -u > /tmp/ids_found.txt || true
+          echo "Found ids:"
+          cat /tmp/ids_found.txt || true
 
-      - name: Save new chat IDs
+      - name: Merge new chat IDs and push
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
-          jq -r '.. | .chat? | .id? // empty' /tmp/updates.json | sort -u > /tmp/new_chat_ids.txt
-
           while IFS= read -r id; do
-            case "$id" in ""|\#*) continue ;; esac
+            [ -z "$id" ] && continue
             if ! grep -Fxq "$id" chat_ids.txt; then
               echo "$id" >> chat_ids.txt
-              echo "Added new chat id: $id"
+              echo "added $id"
             fi
-          done < /tmp/new_chat_ids.txt
-
-          git add chat_ids.txt
+          done < /tmp/ids_found.txt
+          git add chat_ids.txt || true
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git commit -m "Update chat_ids (auto)" || true
-
+          git commit -m "Auto: update chat_ids" || true
           if [ -n "${PUSH_TOKEN}" ]; then
             git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           fi
-
           git push || true
 
-      # ----------------------------------------------------
-      # Telegram Broadcast (Photo + Fallback)
-      # ----------------------------------------------------
-      - name: Broadcast decoded playlists
+      - name: Broadcast posts (photo if thumbnail ok, else plain)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           NEWFILE="/tmp/new_posts.txt"
+          CHATFILE="chat_ids.txt"
 
-          escape() {
-            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
-          }
+          escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
-          if [ ! -s "$NEWFILE" ]; then
-            echo "No new posts to broadcast."
+          if [ ! -s "${NEWFILE}" ]; then
+            echo "Nothing to broadcast."
             exit 0
           fi
 
-          while IFS= read -r title && \
-                IFS= read -r thumb && \
-                IFS= read -r link && \
-                IFS= read -r loc && \
-                IFS= read -r sep; do
-
-              safe_title=$(escape "$title")
-              safe_link=$(escape "$link")
-              safe_loc=$(escape "$loc")
-
-              CAPTION="${safe_title}
+          while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
+            safe_title=$(escape "$title")
+            safe_link=$(escape "$link")
+            safe_loc=$(escape "$loc")
+            CAP="${safe_title}
 ${safe_link}
 ${safe_loc}"
-
-              TMP_IMG="/tmp/thumb_$$.jpg"
-              DL_OK=0
-
-              if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ]; then
-                if curl -fsSL --max-time 20 -o "$TMP_IMG" "$thumb"; then
-                  if [ -s "$TMP_IMG" ] && [ $(stat -c%s "$TMP_IMG") -gt 1024 ]; then
-                    DL_OK=1
-                  fi
+            TMP_IMG="/tmp/thumb_$$.jpg"
+            DL_OK=0
+            if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ]; then
+              if curl -fsSL --max-time 20 -o "$TMP_IMG" "$thumb"; then
+                if [ -s "$TMP_IMG" ] && [ $(stat -c%s "$TMP_IMG") -gt 1024 ]; then
+                  DL_OK=1
+                else
+                  rm -f "$TMP_IMG" || true
                 fi
               fi
+            fi
 
-              while IFS= read -r cid; do
-                case "$cid" in ""|\#*) continue ;; esac
+            while IFS= read -r cid; do
+              case "$cid" in ""|\#*) continue ;; esac
+              if [ "$DL_OK" -eq 1 ]; then
+                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                  -F chat_id="$cid" \
+                  -F "photo=@${TMP_IMG}" \
+                  --data-urlencode "caption=${CAP}" > /tmp/tresp.json
+              else
+                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                  -d chat_id="$cid" \
+                  --data-urlencode "text=${CAP}" > /tmp/tresp.json
+              fi
+              jq -r '.ok, .description // "no description", .error_code // "none"' /tmp/tresp.json || true
+              sleep 1
+            done < "${CHATFILE}"
 
-                if [ "$DL_OK" -eq 1 ]; then
-                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                    -F chat_id="$cid" \
-                    -F "photo=@${TMP_IMG}" \
-                    --data-urlencode "caption=${CAPTION}" > /dev/null
-                else
-                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                    -d chat_id="$cid" \
-                    --data-urlencode "text=${CAPTION}" > /dev/null
-                fi
+            rm -f "$TMP_IMG" || true
+          done < "${NEWFILE}"
 
-                sleep 1
-              done < chat_ids.txt
-
-              rm -f "$TMP_IMG" || true
-
-          done < "$NEWFILE"
-
-      - name: Done
-        run: echo "Workflow completed successfully."
+      - name: Finish
+        run: echo "Done."
