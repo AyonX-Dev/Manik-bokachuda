@@ -1,8 +1,8 @@
-name: Sitemap → Decode → GitHub + Telegram (final, dedupe & flock-safe)
+name: Sitemap → Decode → GitHub + Telegram (JSON-based, dedupe & flock-safe)
 
 on:
   schedule:
-    - cron: '0 1 * * *'    # daily 01:00 UTC (change as needed)
+    - cron: '0 1 * * *'    # daily 01:00 UTC (change if needed)
   workflow_dispatch:
 
 jobs:
@@ -51,6 +51,9 @@ jobs:
           python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
           ls -l /tmp/new_posts.txt || true
           sed -n '1,200p' /tmp/new_posts.txt || true
+          # decoded_results.json is produced by the script when new posts exist
+          ls -l /tmp/decoded_results.json || true
+          jq -C . /tmp/decoded_results.json 2>/dev/null || true
         shell: bash
 
       - name: Commit decoded results (if any)
@@ -58,7 +61,8 @@ jobs:
         run: |
           if [ -s /tmp/new_posts.txt ]; then
             cp /tmp/new_posts.txt decoded_results.txt
-            git add sitemap_urls.txt found_playlists.txt decoded_results.txt || true
+            cp /tmp/decoded_results.json decoded_results.json || true
+            git add sitemap_urls.txt found_playlists.txt decoded_results.txt decoded_results.json || true
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             if git diff --staged --quiet; then
@@ -87,16 +91,12 @@ jobs:
           CHATFILE="chat_ids.txt"
           NEWIDS="/tmp/new_chat_ids.txt"
 
-          # fetch updates (make sure webhook deleted if using getUpdates)
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
-
-          # extract chat ids (unique set)
           jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true
           : > ${NEWIDS}
 
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            # exact-match check; if exists, skip; else append
             if grep -Fqx "$id" "${CHATFILE}"; then
               echo "exists: $id"
             else
@@ -106,10 +106,9 @@ jobs:
             fi
           done < /tmp/ids_found.txt
 
-          # ensure chat_ids.txt unique (keep first occurrence)
+          # dedupe chat_ids.txt (keep first occurrence)
           awk '!seen[$0]++' "${CHATFILE}" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "${CHATFILE}"
 
-          # commit chat_ids.txt if changed
           git add "${CHATFILE}" || true
           if git diff --staged --quiet; then
             echo "chat ids unchanged"
@@ -126,12 +125,12 @@ jobs:
           fi
         shell: bash
 
-      - name: Send pending posts to NEW chat IDs only (no duplicates, flock-safe)
+      - name: Send pending posts to NEW chat IDs (from JSON, flock-safe)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           NEWIDS="/tmp/new_chat_ids.txt"
-          PENDING="/tmp/new_posts.txt"
+          JSON="/tmp/decoded_results.json"
           SENTLOG="sent_log.txt"
           LOCK="/tmp/sent_log.lock"
 
@@ -141,28 +140,31 @@ jobs:
             echo "No newly added chat ids."
             exit 0
           fi
-          if [ ! -s "${PENDING}" ]; then
-            echo "No pending posts to send to new ids."
+          if [ ! -s "${JSON}" ]; then
+            echo "No JSON results to send to new ids."
             exit 0
           fi
 
-          while IFS= read -r newcid; do
-            [ -z "$newcid" ] && continue
-            while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
-              postid="${link}"
-              CAPTION=$(printf "%s\n%s" "$title" "$link")
+          jq -c '.[]' "${JSON}" | while read -r item; do
+            title=$(jq -r '.title // ""'   <<<"$item")
+            thumb=$(jq -r '.thumbnail // ""'<<<"$item")
+            link=$(jq -r '.playlist // ""'  <<<"$item")
+            loc=$(jq -r '.loc // ""'        <<<"$item")
+            postid="${link}"
+            CAPTION=$(printf "%s\n%s" "$title" "$link")
+
+            while IFS= read -r newcid; do
+              [ -z "$newcid" ] && continue
 
               (
                 flock -x 200
 
-                # skip if already logged
                 if grep -Fqx "${newcid}|${postid}" "${SENTLOG}"; then
                   echo "Already sent to ${newcid} -> ${postid}, skipping"
                   exit 0
                 fi
 
-                # send (photo if valid thumb)
-                if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
+                if [ -n "$thumb" ] && is_valid_url "$thumb"; then
                   resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                     -d chat_id="${newcid}" \
                     --data-urlencode "photo=${thumb}" \
@@ -173,58 +175,44 @@ jobs:
                     --data-urlencode "text=${CAPTION}")
                 fi
 
-                # record last response for debugging
                 echo "${resp}" > /tmp/last_send_resp.json
-
-                # append to sent_log (prevents duplicates)
                 echo "${newcid}|${postid}" >> "${SENTLOG}"
 
               ) 200>"${LOCK}"
 
-              sleep 0.9
-            done < "${PENDING}"
-          done < "${NEWIDS}"
+              sleep 0.6
+            done < "${NEWIDS}"
 
-          # commit sent_log updates (if any)
-          git add "${SENTLOG}" || true
-          if git diff --staged --quiet; then
-            echo "no new sent log entries"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "chore: update sent_log (auto)" || true
-            if [ -n "${PUSH_TOKEN}" ]; then
-              git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
-              git push origin HEAD || true
-            else
-              git push origin HEAD || true
-            fi
-          fi
+          done
         shell: bash
 
-      - name: Broadcast decoded posts to all chat IDs (no-duplicate per chat, flock-safe)
+      - name: Broadcast decoded posts to all chat IDs (from JSON, flock-safe)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           CHATFILE="chat_ids.txt"
-          NEWFILE="/tmp/new_posts.txt"
+          JSON="/tmp/decoded_results.json"
           SENTLOG="sent_log.txt"
           LOCK="/tmp/sent_log.lock"
 
           is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
 
-          if [ ! -s "${NEWFILE}" ]; then
-            echo "No new posts to broadcast to all."
+          if [ ! -s "${JSON}" ]; then
+            echo "No JSON results to broadcast."
             exit 0
           fi
 
-          while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
+          jq -c '.[]' "${JSON}" | while read -r item; do
+            title=$(jq -r '.title // ""'   <<<"$item")
+            thumb=$(jq -r '.thumbnail // ""'<<<"$item")
+            link=$(jq -r '.playlist // ""'  <<<"$item")
+            loc=$(jq -r '.loc // ""'        <<<"$item")
             postid="${link}"
             CAPTION=$(printf "%s\n%s" "$title" "$link")
 
             while IFS= read -r cid; do
               case "$cid" in
-                \#*|"") continue ;; 
+                \#*|"") continue ;;
               esac
 
               (
@@ -235,7 +223,7 @@ jobs:
                   exit 0
                 fi
 
-                if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
+                if [ -n "$thumb" ] && is_valid_url "$thumb"; then
                   resp=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                     -d chat_id="${cid}" \
                     --data-urlencode "photo=${thumb}" \
@@ -252,15 +240,17 @@ jobs:
               ) 200>"${LOCK}"
 
               echo "Broadcasted to $cid: ${postid}"
-              sleep 0.9
+              sleep 0.6
             done < "${CHATFILE}"
 
-          done < "${NEWFILE}"
+          done
+        shell: bash
 
-          # commit sent_log updates (if any)
-          git add "${SENTLOG}" || true
+      - name: Commit sent_log updates (if any)
+        run: |
+          git add sent_log.txt || true
           if git diff --staged --quiet; then
-            echo "no new sent log entries"
+            echo "no new sent_log entries"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
