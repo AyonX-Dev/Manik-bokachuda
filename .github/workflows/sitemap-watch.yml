@@ -31,19 +31,17 @@ jobs:
           git add sitemap_urls.txt found_playlists.txt || true
           git commit -m "chore: add tracker files (init)" || true
 
-      - name: Run processor
+      - name: Run processor (check latest 5)
         env:
           SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
         run: |
-          python3 scripts/process_sitemap.py --sitemap "$SITEMAP_URL" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt
+          python3 scripts/process_sitemap.py --sitemap "$SITEMAP_URL" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
           ls -l /tmp/new_posts.txt || true
-          echo "::debug::TMP file contents:"
           sed -n '1,200p' /tmp/new_posts.txt || true
 
       - name: Commit discovered files (if any)
         id: commit
         run: |
-          # if new_posts exists and non-empty, copy into repo and add tracked files for commit
           if [ -s /tmp/new_posts.txt ]; then
             cp /tmp/new_posts.txt decoded_results.txt
             git add sitemap_urls.txt found_playlists.txt decoded_results.txt
@@ -53,7 +51,7 @@ jobs:
               echo "no_changes=true" > /tmp/commit_result.txt
             else
               git commit -m "chore: add discovered playlist posts (auto)"
-              # Push: if PUSH_TOKEN secret is set, use it; else default GITHUB_TOKEN is used by checkout action
+              # if PUSH_TOKEN secret is set, use it for push; otherwise default token used
               if [ -n "${{ secrets.PUSH_TOKEN }}" ]; then
                 git remote set-url origin https://x-access-token:${{ secrets.PUSH_TOKEN }}@github.com/${{ github.repository }}.git
                 git push origin HEAD
@@ -76,7 +74,6 @@ jobs:
           FILE=/tmp/new_posts.txt
           if [ -s "$FILE" ]; then
             while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
-              # Build HTML message
               MSG="<b>$(echo "$title" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')<\/b>%0A"
               if [ "$thumb" != "No Thumbnail" ]; then
                 MSG="${MSG}Thumbnail: ${thumb}%0A"
