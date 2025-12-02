@@ -1,37 +1,63 @@
 #!/usr/bin/env python3
-# scripts/process_sitemap.py
-# Only check latest N entries from sitemap (default N=5)
-# Writes results to /tmp/new_posts.txt as:
-# Title
-# Thumbnail
-# Playlist
-# SourceLoc
-# ---
-# And appends tracked files: sitemap_urls.txt and found_playlists.txt
+# scripts/process_sitemap.py (updated)
+# - Check latest N entries from sitemap (default 5)
+# - Deduplicate playlist URLs (per-run and vs found_playlists.txt)
+# - Output /tmp/new_posts.txt (human) and decoded_results.json (machine)
+# - Append tracked files: sitemap_urls.txt and found_playlists.txt
 
-import sys, os, re, time, argparse
-from urllib.parse import urljoin
+import sys
+import os
+import re
+import time
+import json
+import argparse
+from urllib.parse import urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
-# config
+# ---------- config ----------
 TIMEOUT = 20
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"}
 TMP_OUT = "/tmp/new_posts.txt"
+TMP_JSON = "/tmp/decoded_results.json"
 PLAYLIST_RE = re.compile(
     r'(https?://[^\s"\'<>]+?\.(?:m3u8|m3u|mpd|mp4|ts|aac|mkv)(?:\?[^\s"\'<>]*)?)',
     flags=re.IGNORECASE
 )
 
+# ---------- helpers ----------
 def fetch_text(url):
     try:
         r = requests.get(url, timeout=TIMEOUT, headers=HEADERS)
         r.raise_for_status()
         return r.text
     except Exception as e:
-        print(f"[!] fetch failed: {url} -> {e}")
+        print(f"[!] fetch failed: {url} -> {e}", file=sys.stderr)
         return None
+
+def canonical_url(u):
+    # normalize by removing fragment and default ports, strip trailing spaces
+    if not u: return u
+    try:
+        p = urlparse(u.strip())
+        # remove fragment
+        p = p._replace(fragment='')
+        # remove default port numbers
+        netloc = p.netloc
+        if p.scheme == 'http' and netloc.endswith(':80'):
+            netloc = netloc.rsplit(':', 1)[0]
+        if p.scheme == 'https' and netloc.endswith(':443'):
+            netloc = netloc.rsplit(':', 1)[0]
+        p = p._replace(netloc=netloc)
+        # remove trailing slash on path except if only "/"
+        path = p.path
+        if path and path != '/' and path.endswith('/'):
+            path = path.rstrip('/')
+            p = p._replace(path=path)
+        return urlunparse(p)
+    except Exception:
+        return u.strip()
 
 def extract_loc_lastmod_pairs(xml_text):
     pairs = []
@@ -48,7 +74,7 @@ def extract_loc_lastmod_pairs(xml_text):
                     try:
                         dt = datetime.strptime(last, fmt)
                         break
-                    except:
+                    except Exception:
                         dt = None
             pairs.append((loc, dt))
     return pairs
@@ -144,7 +170,7 @@ def decode_base64(s):
         raw = base64.b64decode(nb)
         try:
             return raw.decode('utf-8', 'ignore')
-        except:
+        except Exception:
             return raw.decode('latin1', 'ignore')
     except Exception:
         return None
@@ -153,6 +179,7 @@ def find_playlists(text):
     if not text: return []
     return list(dict.fromkeys(PLAYLIST_RE.findall(text)))
 
+# ---------- main ----------
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--sitemap', required=True)
@@ -180,17 +207,24 @@ def main():
         sys.exit(0)
 
     indexed = [(i, loc, dt) for i, (loc, dt) in enumerate(pairs)]
+    # sort by lastmod (newest first) when available
     indexed.sort(key=lambda x: (x[2] is not None, x[2] if x[2] is not None else datetime.min), reverse=True)
     top_n = indexed[:max_check]
     locs_to_consider = [loc for (_, loc, _) in top_n]
     print(f"[*] total sitemap entries: {len(pairs)}; considering top {len(locs_to_consider)} entries")
 
     tracked = read_tracked(tracked_file)
+    found_playlists_tracked = read_tracked(playlists_file)
+
+    # only consider locs not in tracked sitemap_urls
     new_locs = [l for l in locs_to_consider if l not in tracked]
     print(f"[*] among top {len(locs_to_consider)}, new (not tracked) count: {len(new_locs)}")
 
     found_posts = []
     found_playlists = []
+
+    # per-run seen playlist set (dedupe inside this run)
+    seen_playlist_urls = set()
 
     for loc in new_locs:
         print("[*] processing:", loc)
@@ -202,6 +236,7 @@ def main():
         title = extract_title(html, loc)
         thumb = extract_thumbnail(html, loc)
 
+        # decode data-encrypted fields first
         encs = extract_data_encrypted(html)
         decoded_texts = []
         for e in encs:
@@ -213,21 +248,41 @@ def main():
         for dt in decoded_texts:
             playlist_urls += find_playlists(dt)
 
+        # fallback: search page html too
         playlist_urls += find_playlists(html)
-        seen = set()
-        playlist_urls = [x for x in playlist_urls if not (x in seen or seen.add(x))]
 
-        if playlist_urls:
-            final = playlist_urls[0]
+        # canonicalize and dedupe (preserve first appearance order)
+        clean_urls = []
+        seen_local = set()
+        for u in playlist_urls:
+            cu = canonical_url(u)
+            if cu in seen_local: 
+                continue
+            seen_local.add(cu)
+            # skip if already globally tracked
+            if cu in found_playlists_tracked:
+                print(f"[-] playlist already tracked before, skip: {cu}")
+                continue
+            # skip if already seen in this run
+            if cu in seen_playlist_urls:
+                print(f"[-] playlist already found earlier in this run, skip: {cu}")
+                continue
+            clean_urls.append(cu)
+
+        if clean_urls:
+            final = clean_urls[0]
             found_posts.append({"loc": loc, "title": title, "thumbnail": thumb, "playlist": final})
             found_playlists.append(final)
+            seen_playlist_urls.add(final)
             print("[+] FOUND playlist:", final, "title:", title)
         else:
-            print("[-] no playlist found for:", loc)
+            print("[-] no new playlist found for:", loc)
 
         time.sleep(0.6)
 
+    # write outputs and update tracked files
     if found_posts:
+        # write human readable block
         with open(out_file, 'w', encoding='utf-8') as f:
             for p in found_posts:
                 f.write(p['title'] + "\n")
@@ -235,13 +290,32 @@ def main():
                 f.write(p['playlist'] + "\n")
                 f.write(p['loc'] + "\n")
                 f.write("---\n")
+
+        # write machine readable JSON (array)
+        try:
+            with open(TMP_JSON, 'w', encoding='utf-8') as jf:
+                json.dump(found_posts, jf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print("[!] failed to write json:", e, file=sys.stderr)
+
+        # append tracked lists
         append_tracked(playlists_file, found_playlists)
         append_tracked(tracked_file, [p['loc'] for p in found_posts])
+
         print("[*] wrote", len(found_posts), "new posts to", out_file)
+        print("[*] also wrote json to", TMP_JSON)
     else:
+        # remove existing out file if exists (no new posts)
         if os.path.exists(out_file):
-            try: os.remove(out_file)
-            except: pass
+            try:
+                os.remove(out_file)
+            except Exception:
+                pass
+        if os.path.exists(TMP_JSON):
+            try:
+                os.remove(TMP_JSON)
+            except Exception:
+                pass
         print("[*] no new playlist posts discovered")
 
 if __name__ == "__main__":
