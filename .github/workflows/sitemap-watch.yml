@@ -1,8 +1,8 @@
-name: Sitemap → Decode → GitHub + Telegram (auto chat capture & broadcast)
+name: Sitemap → Decode → GitHub + Telegram (no-duplicate sends)
 
 on:
   schedule:
-    - cron: '0 1 * * *'    # daily 01:00 UTC (change as needed)
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -10,9 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
-      # TELEGRAM_BOT_TOKEN must be set in repo secrets
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      # optional: PUSH_TOKEN (PAT) if branch protection blocks GITHUB_TOKEN push
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
     steps:
@@ -21,14 +19,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python + jq
+      - name: Setup tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq
           python -m pip install --upgrade pip
         shell: bash
 
-      - name: Setup Python env
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
@@ -42,7 +40,8 @@ jobs:
           [ -f sitemap_urls.txt ] || echo "# sitemap urls collected by actions" > sitemap_urls.txt
           [ -f found_playlists.txt ] || echo "# found playlist urls" > found_playlists.txt
           [ -f chat_ids.txt ] || echo "# chat ids collected by actions" > chat_ids.txt
-          git add sitemap_urls.txt found_playlists.txt chat_ids.txt || true
+          [ -f sent_log.txt ] || echo "# sent log: lines of chatid|postid" > sent_log.txt
+          git add sitemap_urls.txt found_playlists.txt chat_ids.txt sent_log.txt || true
           git commit -m "chore: add tracker files (init)" || true
 
       - name: Run processor (check latest 5)
@@ -56,14 +55,13 @@ jobs:
         run: |
           if [ -s /tmp/new_posts.txt ]; then
             cp /tmp/new_posts.txt decoded_results.txt
-            git add sitemap_urls.txt found_playlists.txt decoded_results.txt
+            git add sitemap_urls.txt found_playlists.txt decoded_results.txt || true
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             if git diff --staged --quiet; then
               echo "no_changes=true" > /tmp/commit_decoded_result.txt
             else
               git commit -m "chore: add discovered playlist posts (auto)"
-              # preference: use PUSH_TOKEN if set (for protected branches)
               if [ -n "${PUSH_TOKEN}" ]; then
                 git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
                 git push origin HEAD
@@ -77,28 +75,21 @@ jobs:
           fi
           cat /tmp/commit_decoded_result.txt
 
-      - name: Auto-capture chat IDs from getUpdates & send pending to new IDs
+      - name: Auto-capture chat IDs from getUpdates & mark new IDs
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           UFILE="/tmp/updates.json"
           CHATFILE="chat_ids.txt"
           NEWIDS="/tmp/new_chat_ids.txt"
-          PENDING="/tmp/new_posts.txt"
 
-          # fetch updates
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
 
-          # extract chat ids found in updates (unique)
           jq -r '.. | .chat? | .id? // empty' ${UFILE} | sort -u > /tmp/ids_found.txt || true
-
-          # prepare new ids file
           : > ${NEWIDS}
 
-          # append unique ids into chat_ids.txt and record which are newly added
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            # skip comment lines in file by design
             if grep -Fxq "$id" "${CHATFILE}"; then
               echo "exists: $id"
             else
@@ -124,53 +115,73 @@ jobs:
             fi
           fi
 
-          # If there are newly added chat ids and there are pending posts, send pending posts only to new ids
-          if [ -s "${NEWIDS}" ] && [ -s "${PENDING}" ]; then
-            echo "Sending pending posts to newly added chat ids..."
-            # helper to send one post block to a single cid
-            send_post_to_cid() {
-              local cid="$1"
-              local title="$2"
-              local thumb="$3"
-              local link="$4"
-              local loc="$5"
+      - name: Send pending posts to NEW chat IDs only (no duplicates)
+        run: |
+          set -e
+          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          NEWIDS="/tmp/new_chat_ids.txt"
+          PENDING="/tmp/new_posts.txt"
+          SENTLOG="sent_log.txt"
 
-              # build caption (real newline)
-              CAPTION=$(printf "%s\n%s" "$title" "$link")
+          is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
 
-              # if thumbnail is valid URL, try sendPhoto; else sendMessage
-              if printf '%s' "$thumb" | grep -E -q '^https?://'; then
-                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                  -d chat_id="$cid" \
-                  --data-urlencode "photo=${thumb}" \
-                  --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
-              else
-                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                  -d chat_id="$cid" \
-                  --data-urlencode "text=${CAPTION}" > /tmp/tresp.json
-              fi
-              jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
-            }
-
-            # iterate over new ids and send all pending posts to them
-            while IFS= read -r newcid; do
-              [ -z "$newcid" ] && continue
-              # iterate posts in PENDING
-              while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
-                send_post_to_cid "$newcid" "$title" "$thumb" "$link" "$loc"
-                sleep 0.9
-              done < "${PENDING}"
-            done < "${NEWIDS}"
-          else
-            echo "No newly added chat ids or no pending posts to send to new ids."
+          if [ ! -s "${NEWIDS}" ]; then
+            echo "No newly added chat ids."
+            exit 0
+          fi
+          if [ ! -s "${PENDING}" ]; then
+            echo "No pending posts to send to new ids."
+            exit 0
           fi
 
-      - name: Broadcast decoded posts to all chat IDs (photo + caption, real newline)
+          # read each new id, send each pending post if not already logged
+          while IFS= read -r newcid; do
+            [ -z "$newcid" ] && continue
+            while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
+              postid="${link}"
+              grep -Fqx "${newcid}|${postid}" "${SENTLOG}" || {
+                CAPTION=$(printf "%s\n%s" "$title" "$link")
+                if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
+                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                    -d chat_id="$newcid" \
+                    --data-urlencode "photo=${thumb}" \
+                    --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
+                else
+                  curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                    -d chat_id="$newcid" \
+                    --data-urlencode "text=${CAPTION}" > /tmp/tresp.json
+                fi
+                jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
+                # log sent
+                echo "${newcid}|${postid}" >> "${SENTLOG}"
+                sleep 0.9
+              }
+            done < "${PENDING}"
+          done < "${NEWIDS}"
+
+          # commit sent_log updates (if any)
+          git add "${SENTLOG}" || true
+          if git diff --staged --quiet; then
+            echo "no new sent log entries"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update sent_log (auto)" || true
+            if [ -n "${PUSH_TOKEN}" ]; then
+              git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+              git push origin HEAD || true
+            else
+              git push origin HEAD || true
+            fi
+          fi
+
+      - name: Broadcast decoded posts to all chat IDs (no-duplicate per chat)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           CHATFILE="chat_ids.txt"
           NEWFILE="/tmp/new_posts.txt"
+          SENTLOG="sent_log.txt"
 
           is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
 
@@ -179,17 +190,22 @@ jobs:
             exit 0
           fi
 
-          # iterate each post block: title, thumb, link, loc, ---
           while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
+            postid="${link}"
             CAPTION=$(printf "%s\n%s" "$title" "$link")
 
-            # broadcast to every chat id in chat_ids.txt
             while IFS= read -r cid; do
               case "$cid" in
-                \#*|"") continue ;; # skip comments/empty
+                \#*|"") continue ;; 
               esac
 
-              echo "Broadcasting to $cid ..."
+              # skip if already sent to this chat
+              if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
+                echo "Skip (already sent): ${cid} -> ${postid}"
+                continue
+              fi
+
+              echo "Broadcasting to $cid: ${postid}"
               if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
                 curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                   -d chat_id="$cid" \
@@ -202,65 +218,30 @@ jobs:
               fi
 
               jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
+
+              # on success (or even failure) append log to avoid repeated retries causing duplicates;
+              # If you want to only log on ok=true, inspect /tmp/tresp.json before logging.
+              echo "${cid}|${postid}" >> "${SENTLOG}"
               sleep 0.9
             done < "${CHATFILE}"
 
           done < "${NEWFILE}"
-      - name: Broadcast decoded posts to all chat IDs (photo + caption, real newline)
-        run: |
-          set -e
-          TOKEN="${TELEGRAM_BOT_TOKEN}"
-          CHATFILE="chat_ids.txt"
-          NEWFILE="/tmp/new_posts.txt"
 
-          # helper: basic url check
-          is_valid_url() {
-            printf '%s' "$1" | grep -E -q '^https?://'
-          }
-
-          if [ ! -s "${NEWFILE}" ]; then
-            echo "No new posts to broadcast."
-            exit 0
-          fi
-
-          # iterate each post block: title, thumb, link, loc, ---
-          while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
-
-            # build actual caption with a real newline between title and playlist link
-            CAPTION=$(printf "%s\n%s" "$title" "$link")
-
-            if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
-              echo "Broadcasting photo post: title=${title} playlist=${link}"
-              while IFS= read -r cid; do
-                case "$cid" in
-                  \#*|"") continue ;; 
-                esac
-
-                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                  -d chat_id="$cid" \
-                  --data-urlencode "photo=${thumb}" \
-                  --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
-
-                jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
-                sleep 0.9
-              done < "${CHATFILE}"
+          # commit sent_log updates (if any)
+          git add "${SENTLOG}" || true
+          if git diff --staged --quiet; then
+            echo "no new sent log entries"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update sent_log (auto)" || true
+            if [ -n "${PUSH_TOKEN}" ]; then
+              git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+              git push origin HEAD || true
             else
-              echo "Broadcasting text post (no valid thumb): title=${title} playlist=${link}"
-              while IFS= read -r cid; do
-                case "$cid" in
-                  \#*|"") continue ;;
-                esac
-
-                curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                  -d chat_id="$cid" \
-                  --data-urlencode "text=${CAPTION}" > /tmp/tresp.json
-
-                jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
-                sleep 0.9
-              done < "${CHATFILE}"
+              git push origin HEAD || true
             fi
-
-          done < "${NEWFILE}"
+          fi
 
       - name: Final status
         run: |
