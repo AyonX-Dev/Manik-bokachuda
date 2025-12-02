@@ -119,20 +119,15 @@ jobs:
             fi
           fi
 
-      - name: Broadcast decoded posts to all chat IDs (photo + caption)
+      - name: Broadcast decoded posts to all chat IDs (photo + caption, real newline)
         run: |
           set -e
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           CHATFILE="chat_ids.txt"
           NEWFILE="/tmp/new_posts.txt"
 
-          # helper: escape &, <, >
-          escape_html() {
-            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
-          }
-
+          # helper: basic url check
           is_valid_url() {
-            # basic check
             printf '%s' "$1" | grep -E -q '^https?://'
           }
 
@@ -141,33 +136,28 @@ jobs:
             exit 0
           fi
 
-          # each post block: title, thumb, link, loc, ---
+          # iterate each post block: title, thumb, link, loc, ---
           while IFS= read -r title && IFS= read -r thumb && IFS= read -r link && IFS= read -r loc && IFS= read -r sep; do
-            # Build caption: Title newline PlaylistURL
-            # We will NOT use parse_mode (send plain caption) to avoid HTML parsing errors.
-            CAPTION="${title}\n${link}"
 
-            # URL-encode parts when sending via curl
-            # If thumbnail is a valid URL, try sendPhoto (Telegram will fetch the image from URL).
+            # build actual caption with a real newline between title and playlist link
+            CAPTION=$(printf "%s\n%s" "$title" "$link")
+
             if [ -n "$thumb" ] && [ "$thumb" != "No Thumbnail" ] && is_valid_url "$thumb"; then
               echo "Broadcasting photo post: title=${title} playlist=${link}"
               while IFS= read -r cid; do
                 case "$cid" in
-                  \#*|"") continue ;; # skip comments/empty
+                  \#*|"") continue ;; 
                 esac
 
-                # sendPhoto with caption (caption plain text, newline preserved via --data-urlencode)
                 curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                   -d chat_id="$cid" \
                   --data-urlencode "photo=${thumb}" \
                   --data-urlencode "caption=${CAPTION}" > /tmp/tresp.json
 
-                # show brief result in logs (ok true/false)
                 jq -r '. | {ok, description, error_code}' /tmp/tresp.json || true
                 sleep 0.9
               done < "${CHATFILE}"
             else
-              # fallback: no valid thumb — send simple text message with title + newline + playlist
               echo "Broadcasting text post (no valid thumb): title=${title} playlist=${link}"
               while IFS= read -r cid; do
                 case "$cid" in
