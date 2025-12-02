@@ -1,8 +1,8 @@
-name: Sitemap → Decode → GitHub + Telegram (final, collect ALL chat ids)
+name: Sitemap → Decode → GitHub + Telegram (final: all chat types, send-to-all)
 
 on:
   schedule:
-    - cron: '0 1 * * *'    # daily 01:00 UTC (change if needed)
+    - cron: '0 1 * * *'    # daily 01:00 UTC (adjust if needed)
   workflow_dispatch:
 
 jobs:
@@ -89,10 +89,10 @@ jobs:
           CHATFILE="chat_ids.txt"
           UFILE="/tmp/updates.json"
 
-          # Fetch all updates
+          # Fetch updates (if webhook active, getUpdates may be empty/error)
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
 
-          # Extract ALL chat ids from all common update formats
+          # Extract all potential chat ids from common update structures
           jq -r '
             .result[]? |
             (
@@ -105,7 +105,7 @@ jobs:
             )
           ' ${UFILE} | grep -v null | sort -u > /tmp/all_ids.txt || true
 
-          # Insert new chat ids into chat_ids.txt if not exists
+          # Append new ids to chat_ids.txt if not already present
           while IFS= read -r id; do
             [ -z "$id" ] && continue
             if grep -Fqx "$id" "$CHATFILE"; then
@@ -116,10 +116,10 @@ jobs:
             fi
           done < /tmp/all_ids.txt
 
-          # Remove duplicates and keep first occurrence
+          # Deduplicate (keep first occurrence)
           awk '!seen[$0]++' "$CHATFILE" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "$CHATFILE"
 
-          # Commit updated chat_ids.txt
+          # Commit if changed
           git add "$CHATFILE" || true
           if ! git diff --staged --quiet; then
             git config user.name "github-actions[bot]"
@@ -152,10 +152,10 @@ jobs:
             exit 0
           fi
 
-          # read all chat ids into an array (ignore comments/blank)
+          # load chat ids into array (ignore blank/comment lines)
           mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "${CHATFILE}" || true)
 
-          # iterate posts
+          # iterate posts (JSON array produced by process_sitemap.py)
           jq -c '.[]' "${JSON}" | while read -r item; do
             title=$(jq -r '.title // ""'   <<<"$item")
             thumb=$(jq -r '.thumbnail // ""'<<<"$item")
@@ -164,13 +164,12 @@ jobs:
             CAPTION=$(printf "%s\n%s" "$title" "$link")
 
             for cid in "${ALL_CIDS[@]}"; do
-              # skip empty/comment lines
+              # skip if empty/comment
               if [[ -z "${cid}" || "${cid}" =~ ^\# ]]; then
                 continue
               fi
 
               echo "=> Attempt send to: ${cid} (post: ${postid})"
-
               attempts=0
               max_attempts=3
               success=false
@@ -181,13 +180,13 @@ jobs:
                 (
                   flock -x 200
 
-                  # if logged as sent, skip
+                  # skip if already logged as sent
                   if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
                     echo "Already sent (log exists): ${cid} -> ${postid}"
                     exit 0
                   fi
 
-                  # perform send
+                  # perform send (use sendPhoto when thumbnail URL valid)
                   if [ -n "$thumb" ] && is_valid_url "$thumb"; then
                     resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                       -d chat_id="${cid}" \
@@ -199,6 +198,7 @@ jobs:
                       --data-urlencode "text=${CAPTION}")
                   fi
 
+                  # save response
                   echo "${resp}" > /tmp/last_send_resp_${cid}.json || true
                   ok=$(jq -r '.ok // false' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "false")
                   desc=$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")
@@ -211,6 +211,7 @@ jobs:
                     exit 0
                   else
                     echo "Send FAILED -> ${cid} (post: ${postid}) ; reason: ${desc} ; code: ${errcode}"
+                    # retry on transient (429 or server 5xx)
                     if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
                       echo "Transient error, will retry (attempt ${attempts}/${max_attempts})"
                       exit 1
@@ -237,11 +238,12 @@ jobs:
                 echo "Final: failed to send to ${cid} after ${attempts} attempts. See /tmp/last_send_resp_${cid}.json"
               fi
 
+              # brief pause to avoid hitting rate limits
               sleep 0.6
             done
           done
 
-          # commit sent_log updates (if any)
+          # commit sent_log updates if any
           git add "${SENTLOG}" || true
           if git diff --staged --quiet; then
             echo "no new sent_log entries"
