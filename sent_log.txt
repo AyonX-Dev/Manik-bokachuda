@@ -1,1 +1,9 @@
 # sent log: lines of chatid|postid
+-1002148892903|https://raw.githubusercontent.com/iptv-org/iptv/master/streams/in.m3u
+-1003269177184|https://raw.githubusercontent.com/iptv-org/iptv/master/streams/in.m3u
+5345775191|https://raw.githubusercontent.com/iptv-org/iptv/master/streams/in.m3u
+8212077263|https://raw.githubusercontent.com/iptv-org/iptv/master/streams/in.m3u
+-1002148892903|https://iptv-org.github.io/iptv/countries/bd.m3u
+-1003269177184|https://iptv-org.github.io/iptv/countries/bd.m3u
+5345775191|https://iptv-org.github.io/iptv/countries/bd.m3u
+8212077263|https://iptv-org.github.io/iptv/countries/bd.m3u
