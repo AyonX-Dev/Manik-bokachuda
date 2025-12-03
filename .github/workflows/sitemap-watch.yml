@@ -143,7 +143,7 @@ jobs:
           fi
         shell: bash
 
-      - name: Broadcast (simple, lock via mkdir, handle blocked)
+      - name: Broadcast (photo → fallback to message → block safely)
         run: |
           set -euo pipefail
           TOKEN="${TELEGRAM_BOT_TOKEN}"
@@ -151,7 +151,7 @@ jobs:
           BLOCKFILE="blocked_chats.txt"
           JSON="/tmp/decoded_results.json"
           SENTLOG="sent_log.txt"
-          LOCKDIR="/tmp/sent_log.lockdir"
+          LOCKDIR="/tmp/sendlock"
 
           [ -f "${BLOCKFILE}" ] || echo "# blocked chat ids" > "${BLOCKFILE}"
 
@@ -160,13 +160,10 @@ jobs:
             exit 0
           fi
 
-          # read chat ids into array (simple)
-          echo "[*] Loading chat ids..."
           IDS_TMP="/tmp/ids_to_use.txt"
           grep -vE '^\s*#|^\s*$' "${CHATFILE}" | tr -d '\r' > "${IDS_TMP}" || true
           echo "[*] total chat ids:" $(wc -l < "${IDS_TMP}" || echo 0)
 
-          # For each discovered post object
           jq -c '.[]' "${JSON}" | while read -r item; do
             title=$(jq -r '.title // ""' <<<"$item")
             thumb=$(jq -r '.thumbnail // ""' <<<"$item")
@@ -178,8 +175,8 @@ jobs:
               cid="$(echo "$cid" | xargs)"
               [ -z "$cid" ] && continue
 
-              # skip blocked
-              if grep -Fxq "$cid" "${BLOCKFILE}"; then
+              # skip blocked early
+              if grep -Fxq -- "$cid" "${BLOCKFILE}"; then
                 echo "[!] skipping blocked: $cid"
                 continue
               fi
@@ -199,57 +196,92 @@ jobs:
               while [ $attempts -lt $max_attempts ]; do
                 attempts=$((attempts+1))
 
-                # send (photo if exists and is http)
+                # Try sendPhoto first if thumbnail looks like URL
                 if [ -n "$thumb" ] && printf "%s" "$thumb" | grep -E -q '^https?://'; then
-                  resp=$(curl -s -m 25 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" -d chat_id="${cid}" --data-urlencode "photo=${thumb}" --data-urlencode "caption=${caption}" ) || true
+                  resp=$(curl -s -m 25 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                    -d chat_id="${cid}" --data-urlencode "photo=${thumb}" --data-urlencode "caption=${caption}" ) || true
                 else
-                  resp=$(curl -s -m 25 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" -d chat_id="${cid}" --data-urlencode "text=${caption}" ) || true
+                  resp='{"ok":false,"description":"no-photo"}'
                 fi
 
-                # save resp
                 echo "${resp}" > /tmp/last_send_resp_${cid}.json || true
                 ok=$(jq -r '.ok // false' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "false")
                 errcode=$(jq -r '.error_code // 0' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "0")
                 desc=$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")
 
                 if [ "$ok" = "true" ]; then
-                  # acquire lock (mkdir atomic)
+                  # success with photo -> record and break
+                  # lock and append to sent_log
                   t=0
                   while ! mkdir "${LOCKDIR}" 2>/dev/null; do
-                    t=$((t+1))
-                    if [ $t -gt 20 ]; then break; fi
-                    sleep 0.1
+                    t=$((t+1)); sleep 0.05
+                    if [ $t -gt 100 ]; then break; fi
                   done
                   echo "${cid}|${postid}" >> "${SENTLOG}"
                   rmdir "${LOCKDIR}" 2>/dev/null || true
-                  echo "[+] send OK -> ${cid}"
+                  echo "[+] sendPhoto OK -> ${cid}"
                   delivered=true
                   break
                 fi
 
-                # not ok -> check code
+                # if photo failed due to rights (common 400 msg), try sendMessage fallback
+                if [ "${errcode}" = "400" ] && printf "%s" "$desc" | grep -qi "not enough rights to send photos"; then
+                  echo "[~] sendPhoto forbidden for ${cid}; trying sendMessage fallback..."
+                  resp2=$(curl -s -m 25 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                    -d chat_id="${cid}" --data-urlencode "text=${caption}" ) || true
+                  echo "${resp2}" > /tmp/last_send_resp_${cid}.json || true
+                  ok2=$(jq -r '.ok // false' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "false")
+                  err2=$(jq -r '.error_code // 0' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "0")
+                  if [ "$ok2" = "true" ]; then
+                    # record success
+                    t=0
+                    while ! mkdir "${LOCKDIR}" 2>/dev/null; do
+                      t=$((t+1)); sleep 0.05
+                      if [ $t -gt 100 ]; then break; fi
+                    done
+                    echo "${cid}|${postid}" >> "${SENTLOG}"
+                    rmdir "${LOCKDIR}" 2>/dev/null || true
+                    echo "[+] sendMessage OK -> ${cid}"
+                    delivered=true
+                    break
+                  else
+                    # sendMessage failed; treat according to error
+                    echo "[-] sendMessage also failed for ${cid}: $(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json)"
+                    # if permanent, add to blocked below
+                    errcode="$err2"
+                    desc="$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")"
+                  fi
+                fi
+
+                # handle other responses: transient vs permanent
                 if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
                   echo "[~] transient (${errcode}) -> attempt ${attempts}/${max_attempts}"
                   sleep $((attempts * 2))
                   continue
                 else
-                  # permanent -> block and stop retrying
+                  # permanent -> block
                   echo "[-] permanent failure for ${cid}: ${desc} (code ${errcode})"
-                  if ! grep -Fxq "$cid" "${BLOCKFILE}"; then
+                  # atomically add to blocked_chats (avoid dup)
+                  t=0
+                  while ! mkdir "${LOCKDIR}" 2>/dev/null; do
+                    t=$((t+1)); sleep 0.05
+                    if [ $t -gt 100 ]; then break; fi
+                  done
+                  if ! grep -Fxq -- "$cid" "${BLOCKFILE}"; then
                     echo "$cid" >> "${BLOCKFILE}"
-                    echo "[!] added ${cid} to blocked_chats"
+                    echo "[!] added ${cid} to ${BLOCKFILE}"
                   fi
+                  rmdir "${LOCKDIR}" 2>/dev/null || true
                   break
                 fi
-              done
+
+              done  # attempts loop
 
               if [ "$delivered" != "true" ]; then
                 echo "[*] not delivered to ${cid} after ${attempts} attempts."
               fi
 
-              # light throttle
               sleep 0.6
-
             done < "${IDS_TMP}"
 
           done
@@ -257,8 +289,8 @@ jobs:
           # commit logs if changed
           git add "${SENTLOG}" "${BLOCKFILE}" || true
           if ! git diff --staged --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config user.name "github-actions[bot]" || true
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com" || true
             git commit -m "chore: update sent_log/blocked_chats (auto)" || true
             if [ -n "${PUSH_TOKEN:-}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
