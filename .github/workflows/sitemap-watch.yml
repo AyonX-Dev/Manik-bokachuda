@@ -1,4 +1,4 @@
-name: Sitemap → Decode → GitHub + Telegram (final, robust)
+name: Sitemap → Decode → GitHub + Telegram (final, robust & fixed)
 
 on:
   schedule:
@@ -123,15 +123,18 @@ jobs:
               .shipping_query.from.id?,
               .poll_answer.user.id?
             )
-          ' ${UFILE} | grep -v null | sort -u > /tmp/all_ids.txt || true
+          ' ${UFILE} | grep -v null | sort -u | tr -d '\r' > /tmp/all_ids.txt || true
 
           echo "[*] IDs found:"
           sed -n '1,200p' /tmp/all_ids.txt || true
 
-          # Append new ids to chat_ids.txt
+          # Append any new ids to chat_ids.txt (keep existing order)
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            if grep -Fqx "$id" "$CHATFILE"; then
+            # trim whitespace / CR
+            id="$(echo "$id" | tr -d '\r' | xargs)"
+            if [ -z "$id" ]; then continue; fi
+            if grep -Fqx -- "$id" "$CHATFILE"; then
               echo "exists: $id"
             else
               echo "$id" >> "$CHATFILE"
@@ -139,7 +142,7 @@ jobs:
             fi
           done < /tmp/all_ids.txt
 
-          # Dedupe (keep first occurrence)
+          # Deduplicate & keep first occurrence
           awk '!seen[$0]++' "$CHATFILE" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "$CHATFILE"
 
           git add "$CHATFILE" || true
@@ -176,6 +179,11 @@ jobs:
 
           # load chat ids (ignore comments/blank)
           mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "${CHATFILE}" || true)
+          # sanitize each id (remove CR and trim)
+          for i in "${!ALL_CIDS[@]}"; do
+            ALL_CIDS[$i]=$(echo "${ALL_CIDS[$i]}" | tr -d '\r' | xargs)
+          done
+
           echo "[*] total chat ids to attempt:" "${#ALL_CIDS[@]}"
 
           # iterate posts
@@ -204,8 +212,8 @@ jobs:
                 (
                   flock -x 200
 
-                  # if already logged as sent, skip
-                  if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
+                  # if already logged as sent, skip (use -- to stop grep treating leading '-' as option)
+                  if grep -Fqx -- "${cid}|${postid}" "${SENTLOG}"; then
                     echo "Already logged as sent, skipping: ${cid} -> ${postid}"
                     exit 0
                   fi
