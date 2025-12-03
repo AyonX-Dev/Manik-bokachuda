@@ -1,4 +1,4 @@
-name: Sitemap → Decode → GitHub + Telegram (final, robust & fixed)
+name: Sitemap → Decode → GitHub + Telegram (final, stable)
 
 on:
   schedule:
@@ -10,33 +10,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SITEMAP_URL: "https://www.streamecho.top/sitemap.xml"
-      # TELEGRAM_BOT_TOKEN must be set in repo secrets
-      # optional PUSH_TOKEN in secrets if you want non-interactive push
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install utilities & Python
+      - name: Setup utilities & Python
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq
           python -m pip install --upgrade pip
-        shell: bash
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install python deps
-        run: |
           pip install --upgrade requests beautifulsoup4
         shell: bash
 
-      - name: Ensure tracker files exist
+      - name: Ensure tracker files exist (repo)
         run: |
           [ -f sitemap_urls.txt ] || echo "# sitemap urls collected by actions" > sitemap_urls.txt
           [ -f found_playlists.txt ] || echo "# found playlist urls" > found_playlists.txt
@@ -47,17 +35,16 @@ jobs:
           git commit -m "chore: add tracker files (init)" || true
         shell: bash
 
-      - name: Run sitemap processor (check latest 5)
+      - name: Run sitemap processor (latest N=5)
         run: |
-          echo "[*] Running process_sitemap.py"
-          python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
-          echo "[*] new_posts (preview):"
-          [ -f /tmp/new_posts.txt ] && sed -n '1,200p' /tmp/new_posts.txt || echo "no /tmp/new_posts.txt"
-          echo "[*] decoded_results.json preview (if present):"
-          [ -f /tmp/decoded_results.json ] && jq -C . /tmp/decoded_results.json || echo "no /tmp/decoded_results.json"
+          echo "[*] Running process_sitemap.py (latest 5)"
+          python3 scripts/process_sitemap.py --sitemap "${{ env.SITEMAP_URL }}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
+          echo "[*] Preview /tmp/new_posts.txt (if any):"
+          [ -f /tmp/new_posts.txt ] && sed -n '1,200p' /tmp/new_posts.txt || echo "no new posts"
+          [ -f /tmp/decoded_results.json ] && jq -C . /tmp/decoded_results.json || echo "no decoded_results.json"
         shell: bash
 
-      - name: Commit decoded results (if any)
+      - name: Commit decoded results (if any) & keep decoded artifact
         id: commit_decoded
         run: |
           if [ -s /tmp/new_posts.txt ]; then
@@ -70,6 +57,7 @@ jobs:
               echo "no_changes=true" > /tmp/commit_decoded_result.txt
             else
               git commit -m "chore: add discovered playlist posts (auto)" || true
+              # push if token provided otherwise normal push (will fail if no permissions)
               if [ -n "${{ secrets.PUSH_TOKEN || '' }}" ]; then
                 git remote set-url origin https://x-access-token:${{ secrets.PUSH_TOKEN }}@github.com/${{ github.repository }}.git
                 git push origin HEAD || true
@@ -83,6 +71,17 @@ jobs:
           fi
           cat /tmp/commit_decoded_result.txt
         shell: bash
+
+      - name: Upload decoded_results artifact (if present)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decoded-results
+          path: |
+            /tmp/decoded_results.json
+            /tmp/new_posts.txt
+            decoded_results.txt
+            decoded_results.json
 
       - name: Auto-capture chat IDs from getUpdates (delete webhook if set; collect ALL types)
         env:
@@ -98,18 +97,18 @@ jobs:
           wh_url=$(jq -r '.result.url // empty' <<<"$wh_info" 2>/dev/null || echo "")
 
           if [ -n "$wh_url" ]; then
-            echo "[*] Webhook detected (url: $wh_url) — deleting webhook so getUpdates works."
+            echo "[*] Webhook detected — deleting to allow getUpdates."
             curl -s -X POST "https://api.telegram.org/bot${TOKEN}/deleteWebhook" > /tmp/deletewh.json || true
             cat /tmp/deletewh.json || true
             sleep 1
           else
-            echo "[*] No webhook set — proceeding to getUpdates."
+            echo "[*] No webhook set — using getUpdates."
           fi
 
           echo "[*] Fetching updates..."
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
 
-          echo "[*] Extracting IDs from updates..."
+          echo "[*] Extracting IDs..."
           jq -r '
             .result[]? |
             (
@@ -128,16 +127,14 @@ jobs:
             )
           ' ${UFILE} | grep -v null | sort -u | tr -d '\r' > /tmp/all_ids.txt || true
 
-          echo "[*] IDs found:"
+          echo "[*] IDs discovered:"
           sed -n '1,200p' /tmp/all_ids.txt || true
 
-          # Append any new ids to chat_ids.txt (keep existing order)
+          # Append new IDs to chat_ids.txt (preserve order)
           added=0
           while IFS= read -r id; do
-            [ -z "$id" ] && continue
-            # trim whitespace / CR
             id="$(echo "$id" | tr -d '\r' | xargs)"
-            if [ -z "$id" ]; then continue; fi
+            [ -z "$id" ] && continue
             if grep -Fqx -- "$id" "$CHATFILE"; then
               echo "exists: $id"
             else
@@ -147,10 +144,10 @@ jobs:
             fi
           done < /tmp/all_ids.txt
 
-          # Deduplicate & keep first occurrence
+          # Dedupe & keep first occurrence
           awk '!seen[$0]++' "$CHATFILE" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "$CHATFILE"
 
-          # Commit chat_ids.txt only if updated (minimize pushes)
+          # Commit chat_ids.txt only if updated
           if [ $added -gt 0 ]; then
             git add "$CHATFILE" || true
             git config user.name "github-actions[bot]"
@@ -163,11 +160,11 @@ jobs:
               git push origin HEAD || true
             fi
           else
-            echo "chat ids unchanged"
+            echo "[*] chat_ids unchanged"
           fi
         shell: bash
 
-      - name: Broadcast decoded posts to all chat IDs (robust: block permanent, retry transient)
+      - name: Broadcast (stable: single attempt, block permanent, queue transient)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
@@ -175,156 +172,267 @@ jobs:
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           CHATFILE="chat_ids.txt"
           BLOCKFILE="blocked_chats.txt"
-          JSON="/tmp/decoded_results.json"
           SENTLOG="sent_log.txt"
-          LOCK="/tmp/sent_log.lock"
           RETRYQ="/tmp/retry_queue.json"
+          JSON="/tmp/decoded_results.json"
+          LOCK="/tmp/sent_log.lock"
 
-          # ensure files exist
-          [ -f "$BLOCKFILE" ] || echo "# blocked chat ids (permanent failures)" > "$BLOCKFILE"
+          [ -f "$BLOCKFILE" ] || echo "# blocked chat ids" > "$BLOCKFILE"
           [ -f "$SENTLOG" ] || echo "# sent log: chatid|postid|unix_ts" > "$SENTLOG"
           [ -f "$RETRYQ" ] || echo "[]" > "$RETRYQ"
 
-          is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
+          is_valid_url(){ printf '%s' "$1" | grep -E -q '^https?://'; }
 
-          if [ ! -s "${JSON}" ]; then
-            echo "[*] No JSON results to broadcast; exiting."
+          if [ ! -s "$JSON" ]; then
+            echo "[*] No decoded results to broadcast; exit"
             exit 0
           fi
 
-          # load chat ids (ignore comments/blank)
-          mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "${CHATFILE}" || true)
-          # sanitize each id (remove CR and trim)
+          mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "$CHATFILE" || true)
           for i in "${!ALL_CIDS[@]}"; do
             ALL_CIDS[$i]=$(echo "${ALL_CIDS[$i]}" | tr -d '\r' | xargs)
           done
-
           echo "[*] total chat ids to attempt:" "${#ALL_CIDS[@]}"
 
           # iterate posts
-          jq -c '.[]' "${JSON}" | while read -r item; do
-            title=$(jq -r '.title // ""'   <<<"$item")
-            thumb=$(jq -r '.thumbnail // ""'<<<"$item")
-            link=$(jq -r '.playlist // ""'  <<<"$item")
-            postid="${link}"
-            CAPTION=$(printf "%s\n%s" "$title" "$link")
+          jq -c '.[]' "$JSON" | while read -r item; do
+            title=$(jq -r '.title // ""' <<<"$item")
+            thumb=$(jq -r '.thumbnail // ""' <<<"$item")
+            link=$(jq -r '.playlist // ""' <<<"$item")
+            postid="$link"
+            caption=$(printf "%s\n%s" "$title" "$link")
 
             for cid in "${ALL_CIDS[@]}"; do
-              # skip empty/comment lines
-              if [[ -z "${cid}" || "${cid}" =~ ^\# ]]; then
+              cid=$(echo "$cid" | tr -d '\r' | xargs)
+              [ -z "$cid" ] && continue
+
+              # skip blocked
+              if grep -Fxq -- "$cid" "$BLOCKFILE"; then
+                echo "[skip blocked] $cid"
                 continue
               fi
 
-              # skip if blocked
-              if grep -Fxq -- "${cid}" "$BLOCKFILE"; then
-                echo "[skip blocked] ${cid}"
+              # skip already sent
+              if grep -Fqx -- "${cid}|${postid}" "$SENTLOG"; then
+                echo "[skip sent] $cid -> $postid"
                 continue
               fi
 
-              echo "[*] Attempt send to: ${cid} (post: ${postid})"
+              echo "[*] Sending to: ${cid} (post: ${postid})"
 
-              attempts=0
-              max_attempts=2
-              delivered=false
+              # single attempt
+              if [ -n "$thumb" ] && is_valid_url "$thumb"; then
+                resp=$(curl -s -m 20 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                  -d chat_id="$cid" --data-urlencode "photo=$thumb" --data-urlencode "caption=$caption")
+              else
+                resp=$(curl -s -m 20 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                  -d chat_id="$cid" --data-urlencode "text=$caption")
+              fi
 
-              while [ $attempts -lt $max_attempts ]; do
-                attempts=$((attempts+1))
+              echo "$resp" > "/tmp/last_send_resp_${cid}.json" || true
+              ok=$(jq -r '.ok // false' "/tmp/last_send_resp_${cid}.json" 2>/dev/null || echo "false")
+              errcode=$(jq -r '.error_code // 0' "/tmp/last_send_resp_${cid}.json" 2>/dev/null || echo "0")
+              desc=$(jq -r '.description // ""' "/tmp/last_send_resp_${cid}.json" 2>/dev/null || echo "")
 
-                (
-                  flock -x 200
-
-                  # skip if already logged as sent (double-check inside lock)
-                  if grep -Fqx -- "${cid}|${postid}" "${SENTLOG}"; then
-                    echo "Already logged as sent, skipping: ${cid} -> ${postid}"
-                    exit 0
-                  fi
-
-                  # perform send (photo if thumb valid)
-                  if [ -n "$thumb" ] && is_valid_url "$thumb"; then
-                    resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                      -d chat_id="${cid}" \
-                      --data-urlencode "photo=${thumb}" \
-                      --data-urlencode "caption=${CAPTION}")
-                  else
-                    resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                      -d chat_id="${cid}" \
-                      --data-urlencode "text=${CAPTION}")
-                  fi
-
-                  # save response for debugging
-                  echo "${resp}" > /tmp/last_send_resp_${cid}.json || true
-                  ok=$(jq -r '.ok // false' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "false")
-                  desc=$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")
-                  errcode=$(jq -r '.error_code // 0' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "0")
-
-                  if [ "$ok" = "true" ] || [ "$ok" = "True" ]; then
-                    echo "${cid}|${postid}|$(date +%s)" >> "${SENTLOG}"
-                    echo "[+] Send OK -> ${cid} (post: ${postid})"
-                    exit 0
-                  else
-                    echo "[-] Send FAILED -> ${cid} (post: ${postid}) ; reason: ${desc} ; code: ${errcode}"
-                    # transient -> retry attempt
-                    if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
-                      echo "[~] Transient error, returning 1 to request retry"
-                      exit 1
-                    else
-                      # permanent -> return 2 so outer can mark blocked
-                      echo "[!] Permanent error, returning 2"
-                      exit 2
-                    fi
-                  fi
-
-                ) 200>"${LOCK}"
-
-                rc=$?
-                if [ $rc -eq 0 ]; then
-                  delivered=true
-                  break
-                elif [ $rc -eq 1 ]; then
-                  echo "[~] transient; backoff then retry (attempt ${attempts}/${max_attempts})"
-                  sleep $((attempts * 2))
-                  continue
-                elif [ $rc -eq 2 ]; then
-                  echo "[-] Marking ${cid} as blocked due to permanent error. See /tmp/last_send_resp_${cid}.json"
-                  # add to blocked (avoid dups)
-                  if ! grep -Fxq -- "${cid}" "$BLOCKFILE"; then
-                    echo "${cid}" >> "$BLOCKFILE"
-                    echo "[blocked] ${cid}"
-                  fi
-                  break
+              if [ "$ok" = "true" ]; then
+                echo "${cid}|${postid}|$(date +%s)" >> "$SENTLOG"
+                echo "[ok] $cid -> $postid"
+              else
+                echo "[fail] $cid -> $postid ; code:$errcode ; $desc"
+                # transient -> queue for retry later
+                if [ "$errcode" = "429" ] || ( [ "$errcode" -ge 500 ] 2>/dev/null ); then
+                  jq --arg cid "$cid" --arg post "$postid" --arg now "$(date +%s)" \
+                    '. + [{cid:$cid,post:$post,ts:$now}]' "$RETRYQ" > "${RETRYQ}.tmp" && mv "${RETRYQ}.tmp" "$RETRYQ"
+                  echo "[queued retry] $cid"
                 else
-                  echo "[!] unexpected rc=${rc} for ${cid}"
-                  break
+                  # permanent -> block
+                  if ! grep -Fxq -- "$cid" "$BLOCKFILE"; then
+                    echo "$cid" >> "$BLOCKFILE"
+                    echo "[blocked] $cid (reason: $desc)"
+                  fi
                 fi
-              done
-
-              if [ "$delivered" != "true" ]; then
-                echo "[*] Did not deliver to ${cid} after ${attempts} attempts."
               fi
 
-              sleep 0.6
+              sleep 0.8
             done
           done
 
-          # Optionally commit sent_log and blocked_chats if you want to persist them to repo.
-          # By default we avoid heavy commits; uncomment below to commit them each run.
-          #
-          # git add "${SENTLOG}" "${BLOCKFILE}" || true
-          # if ! git diff --staged --quiet; then
-          #   git config user.name "github-actions[bot]"
-          #   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          #   git commit -m "chore: update sent_log/blocked_chats (auto)" || true
-          #   if [ -n "${PUSH_TOKEN:-}" ]; then
-          #     git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
-          #     git push origin HEAD || true
-          #   else
-          #     git push origin HEAD || true
-          #   fi
-          # fi
-
+          # upload retry queue artifact for retry worker
+          if [ -s "$RETRYQ" ]; then
+            echo "[*] Uploading retry_queue.json artifact"
+          fi
         shell: bash
+
+      - name: Upload artifacts (chat_ids, sent_log, blocked_chats, retry_queue)
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-state
+          path: |
+            chat_ids.txt
+            sent_log.txt
+            blocked_chats.txt
+            /tmp/retry_queue.json
+            /tmp/decoded_results.json
+
+  retry-worker:
+    needs: watch
+    runs-on: ubuntu-latest
+    if: always()
+    env:
+      # need TELEGRAM_BOT_TOKEN in secrets
+      RETRY_AGE_SECONDS: 86400   # only retry items younger than this (default 24h)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup utils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+        shell: bash
+
+      - name: Download run-state artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: run-state
+          path: /tmp/run-state
+
+      - name: Prepare files for retry job
+        run: |
+          # copy back to workspace paths
+          cp /tmp/run-state/chat_ids.txt ./chat_ids.txt || true
+          cp /tmp/run-state/sent_log.txt ./sent_log.txt || true
+          cp /tmp/run-state/blocked_chats.txt ./blocked_chats.txt || true
+          cp /tmp/run-state/retry_queue.json /tmp/retry_queue.json || echo "[]" > /tmp/retry_queue.json
+          [ -f /tmp/retry_queue.json ] || echo "[]" > /tmp/retry_queue.json
+          echo "Retry queue size:"
+          jq '. | length' /tmp/retry_queue.json || echo "0"
+        shell: bash
+
+      - name: Retry transient failures (process retry_queue.json)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN || '' }}
+        run: |
+          set -euo pipefail
+          TOKEN="${TELEGRAM_BOT_TOKEN}"
+          RETRYQ="/tmp/retry_queue.json"
+          NEWQ="/tmp/retry_queue_new.json"
+          SENTLOG="sent_log.txt"
+          BLOCKFILE="blocked_chats.txt"
+          CHATFILE="chat_ids.txt"
+
+          [ -f "$SENTLOG" ] || echo "# sent log: chatid|postid|unix_ts" > "$SENTLOG"
+          [ -f "$BLOCKFILE" ] || echo "# blocked chat ids" > "$BLOCKFILE"
+          [ -f "$CHATFILE" ] || echo "# chat ids" > "$CHATFILE"
+
+          is_valid_url(){ printf '%s' "$1" | grep -E -q '^https?://'; }
+
+          # start new queue as original
+          jq '.' "$RETRYQ" > "$NEWQ" || echo "[]" > "$NEWQ"
+
+          tmpcount=$(jq '. | length' "$RETRYQ" 2>/dev/null || echo 0)
+          if [ "$tmpcount" -eq 0 ]; then
+            echo "[*] No retry items; nothing to do."
+            exit 0
+          fi
+
+          # Process each item; items: {cid, post, ts}
+          jq -c '.[]' "$RETRYQ" | while read -r item; do
+            cid=$(jq -r '.cid' <<<"$item")
+            post=$(jq -r '.post' <<<"$item")
+            ts=$(jq -r '.ts' <<<"$item")
+            now=$(date +%s)
+            age=$((now - ts))
+
+            # skip old items
+            if [ "$age" -gt "$RETRY_AGE_SECONDS" ]; then
+              echo "[skip old] $cid -> $post (age ${age}s)"
+              # remove this item by filtering later (we'll reconstruct)
+              jq -n --arg cid "$cid" --arg post "$post" '{"cid":$cid,"post":$post,"ts":'$ts'}' >/dev/null
+              # do not attempt
+              continue
+            fi
+
+            # skip if blocked already
+            if grep -Fxq -- "$cid" "$BLOCKFILE"; then
+              echo "[skip blocked] $cid"
+              continue
+            fi
+
+            # skip if already sent
+            if grep -Fqx -- "${cid}|${post}" "$SENTLOG"; then
+              echo "[skip sent] $cid -> $post"
+              continue
+            fi
+
+            echo "[retry] trying $cid -> $post"
+
+            # attempt send (single try)
+            resp=$(curl -s -m 20 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+              -d chat_id="$cid" --data-urlencode "text=${post}")
+            echo "$resp" > "/tmp/last_retry_resp_${cid}.json" || true
+            ok=$(jq -r '.ok // false' "/tmp/last_retry_resp_${cid}.json" 2>/dev/null || echo "false")
+            errcode=$(jq -r '.error_code // 0' "/tmp/last_retry_resp_${cid}.json" 2>/dev/null || echo "0")
+            desc=$(jq -r '.description // ""' "/tmp/last_retry_resp_${cid}.json" 2>/dev/null || echo "")
+
+            if [ "$ok" = "true" ]; then
+              echo "${cid}|${post}|$(date +%s)" >> "$SENTLOG"
+              echo "[ok retry] $cid -> $post"
+              # remove this item from NEWQ
+              jq --arg cid "$cid" --arg post "$post" 'map(select(.cid != $cid or .post != $post))' "$NEWQ" > "${NEWQ}.tmp" && mv "${NEWQ}.tmp" "$NEWQ"
+            else
+              echo "[retry fail] $cid -> $post ; code:$errcode ; $desc"
+              if [ "$errcode" = "429" ] || ( [ "$errcode" -ge 500 ] 2>/dev/null ); then
+                echo "[retry queued again] $cid"
+                # keep item in NEWQ unchanged
+              else
+                # permanent -> block
+                if ! grep -Fxq -- "$cid" "$BLOCKFILE"; then
+                  echo "$cid" >> "$BLOCKFILE"
+                  echo "[blocked (retry)] $cid (reason: $desc)"
+                fi
+                # remove from NEWQ
+                jq --arg cid "$cid" --arg post "$post" 'map(select(.cid != $cid or .post != $post))' "$NEWQ" > "${NEWQ}.tmp" && mv "${NEWQ}.tmp" "$NEWQ"
+              fi
+            fi
+
+            sleep 1
+          done
+
+          # write back new retry queue
+          mv "$NEWQ" "$RETRYQ" || true
+          echo "[*] remaining retry items:" $(jq '.|length' "$RETRYQ" 2>/dev/null || echo 0)
+
+          # Commit updated sent_log and blocked_chats (optional - recommended)
+          git add "$SENTLOG" "$BLOCKFILE" || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update sent_log/blocked_chats (retry worker)" || true
+            if [ -n "${PUSH_TOKEN:-}" ]; then
+              git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+              git push origin HEAD || true
+            else
+              git push origin HEAD || true
+            fi
+          else
+            echo "[*] nothing to commit from retry worker"
+          fi
+        shell: bash
+
+      - name: Upload final run artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-state
+          path: |
+            sent_log.txt
+            blocked_chats.txt
+            /tmp/retry_queue.json
 
       - name: Final status
         run: |
-          echo "Workflow finished. Check /tmp/last_send_resp_<chatid>.json for any failures."
+          echo "Retry worker finished. Inspect sent_log.txt and blocked_chats.txt"
         shell: bash
