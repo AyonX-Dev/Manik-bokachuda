@@ -1,4 +1,4 @@
-name: Sitemap → Decode → GitHub + Telegram (final, robust capture & broadcast)
+name: Sitemap → Decode → GitHub + Telegram (final, robust)
 
 on:
   schedule:
@@ -33,7 +33,7 @@ jobs:
 
       - name: Install python deps
         run: |
-          pip install requests beautifulsoup4
+          pip install --upgrade requests beautifulsoup4
         shell: bash
 
       - name: Ensure tracker files exist
@@ -46,13 +46,14 @@ jobs:
           git commit -m "chore: add tracker files (init)" || true
         shell: bash
 
-      - name: Run processor (check latest 5)
+      - name: Run sitemap processor (check latest 5)
         run: |
+          echo "[*] Running process_sitemap.py"
           python3 scripts/process_sitemap.py --sitemap "${SITEMAP_URL}" --tracked-file sitemap_urls.txt --playlists-file found_playlists.txt --out /tmp/new_posts.txt --max-check 5
-          ls -l /tmp/new_posts.txt || true
-          sed -n '1,200p' /tmp/new_posts.txt || true
-          ls -l /tmp/decoded_results.json || true
-          jq -C . /tmp/decoded_results.json 2>/dev/null || true
+          echo "[*] new_posts (preview):"
+          [ -f /tmp/new_posts.txt ] && sed -n '1,200p' /tmp/new_posts.txt || echo "no /tmp/new_posts.txt"
+          echo "[*] decoded_results.json preview (if present):"
+          [ -f /tmp/decoded_results.json ] && jq -C . /tmp/decoded_results.json || echo "no /tmp/decoded_results.json"
         shell: bash
 
       - name: Commit decoded results (if any)
@@ -60,15 +61,15 @@ jobs:
         run: |
           if [ -s /tmp/new_posts.txt ]; then
             cp /tmp/new_posts.txt decoded_results.txt
-            cp /tmp/decoded_results.json decoded_results.json || true
+            if [ -f /tmp/decoded_results.json ]; then cp /tmp/decoded_results.json decoded_results.json; fi
             git add sitemap_urls.txt found_playlists.txt decoded_results.txt decoded_results.json || true
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             if git diff --staged --quiet; then
               echo "no_changes=true" > /tmp/commit_decoded_result.txt
             else
-              git commit -m "chore: add discovered playlist posts (auto)"
-              if [ -n "${PUSH_TOKEN}" ]; then
+              git commit -m "chore: add discovered playlist posts (auto)" || true
+              if [ -n "${PUSH_TOKEN:-}" ]; then
                 git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
                 git push origin HEAD || true
               else
@@ -94,19 +95,18 @@ jobs:
           wh_url=$(jq -r '.result.url // empty' <<<"$wh_info" 2>/dev/null || echo "")
 
           if [ -n "$wh_url" ]; then
-            echo "[*] Webhook is set (url: $wh_url). Deleting webhook to allow getUpdates..."
+            echo "[*] Webhook detected (url: $wh_url) — deleting webhook so getUpdates works."
             curl -s -X POST "https://api.telegram.org/bot${TOKEN}/deleteWebhook" > /tmp/deletewh.json || true
             cat /tmp/deletewh.json || true
-            # small pause
             sleep 1
           else
-            echo "[*] No webhook set, continuing with getUpdates."
+            echo "[*] No webhook set — proceeding to getUpdates."
           fi
 
-          # Fetch all updates (getUpdates can return empty result)
+          echo "[*] Fetching updates..."
           curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" > ${UFILE} || true
 
-          # Extract chat/user ids from many update shapes
+          echo "[*] Extracting IDs from updates..."
           jq -r '
             .result[]? |
             (
@@ -120,14 +120,15 @@ jobs:
               .callback_query.from.id?,
               .inline_query.from.id?,
               .pre_checkout_query.from.id?,
-              .shipping_query.from.id?
+              .shipping_query.from.id?,
+              .poll_answer.user.id?
             )
           ' ${UFILE} | grep -v null | sort -u > /tmp/all_ids.txt || true
 
-          echo "[*] IDs found from getUpdates:"
+          echo "[*] IDs found:"
           sed -n '1,200p' /tmp/all_ids.txt || true
 
-          # Insert new chat ids into chat_ids.txt if not exists
+          # Append new ids to chat_ids.txt
           while IFS= read -r id; do
             [ -z "$id" ] && continue
             if grep -Fqx "$id" "$CHATFILE"; then
@@ -138,7 +139,7 @@ jobs:
             fi
           done < /tmp/all_ids.txt
 
-          # Deduplicate and keep first occurrence
+          # Dedupe (keep first occurrence)
           awk '!seen[$0]++' "$CHATFILE" > /tmp/chat_ids.tmp && mv /tmp/chat_ids.tmp "$CHATFILE"
 
           git add "$CHATFILE" || true
@@ -146,7 +147,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: update chat_ids (auto)" || true
-            if [ -n "${PUSH_TOKEN}" ]; then
+            if [ -n "${PUSH_TOKEN:-}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
               git push origin HEAD || true
             else
@@ -169,13 +170,13 @@ jobs:
           is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
 
           if [ ! -s "${JSON}" ]; then
-            echo "No JSON results to broadcast."
+            echo "[*] No JSON results to broadcast; exiting."
             exit 0
           fi
 
-          # read all chat ids into an array (ignore comments/blank)
+          # load chat ids (ignore comments/blank)
           mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "${CHATFILE}" || true)
-          echo "[*] Total chat ids to attempt:" "${#ALL_CIDS[@]}"
+          echo "[*] total chat ids to attempt:" "${#ALL_CIDS[@]}"
 
           # iterate posts
           jq -c '.[]' "${JSON}" | while read -r item; do
@@ -191,7 +192,7 @@ jobs:
                 continue
               fi
 
-              echo "=> Attempt send to: ${cid} (post: ${postid})"
+              echo "[*] Attempt send to: ${cid} (post: ${postid})"
 
               attempts=0
               max_attempts=3
@@ -203,9 +204,9 @@ jobs:
                 (
                   flock -x 200
 
-                  # if logged as sent, skip
+                  # if already logged as sent, skip
                   if grep -Fqx "${cid}|${postid}" "${SENTLOG}"; then
-                    echo "Already sent (log exists): ${cid} -> ${postid}"
+                    echo "Already logged as sent, skipping: ${cid} -> ${postid}"
                     exit 0
                   fi
 
@@ -230,12 +231,12 @@ jobs:
                   if [ "$ok" = "true" ] || [ "$ok" = "True" ]; then
                     echo "${cid}|${postid}" >> "${SENTLOG}"
                     success=true
-                    echo "Send OK -> ${cid} (post: ${postid})"
+                    echo "[+] Send OK -> ${cid} (post: ${postid})"
                     exit 0
                   else
-                    echo "Send FAILED -> ${cid} (post: ${postid}) ; reason: ${desc} ; code: ${errcode}"
+                    echo "[-] Send FAILED -> ${cid} (post: ${postid}) ; reason: ${desc} ; code: ${errcode}"
                     if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
-                      echo "Transient error, will retry (attempt ${attempts}/${max_attempts})"
+                      echo "[~] Transient error, will retry (attempt ${attempts}/${max_attempts})"
                       exit 1
                     else
                       # permanent error — do not retry
@@ -268,12 +269,12 @@ jobs:
           # commit sent_log updates (if any)
           git add "${SENTLOG}" || true
           if git diff --staged --quiet; then
-            echo "no new sent_log entries"
+            echo "[*] no new sent_log entries"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: update sent_log (auto)" || true
-            if [ -n "${PUSH_TOKEN}" ]; then
+            if [ -n "${PUSH_TOKEN:-}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
               git push origin HEAD || true
             else
