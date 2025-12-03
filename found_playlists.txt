@@ -13,3 +13,7 @@ https://is.gd/no-link.m3u
 https://iptv-org.github.io/iptv/index.m3u
 https://raw.githubusercontent.com/byte-capsule/Fan-Code-HLS/main/bdix_all.m3u
 https://iptv-org.github.io/iptv/categories/sports.m3u
+
+# added on 2025-12-03T02:40:59Z
+https://raw.githubusercontent.com/iptv-org/iptv/master/streams/in.m3u
+https://iptv-org.github.io/iptv/countries/bd.m3u
