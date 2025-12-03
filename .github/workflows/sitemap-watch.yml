@@ -161,18 +161,14 @@ jobs:
           fi
         shell: bash
 
-      - name: Broadcast decoded posts to all chat IDs (fixed: avoid exit on permanent fail, blocklist)
+      - name: Broadcast decoded posts to all chat IDs (send-to-all, retries, flock-safe)
         run: |
           set -euo pipefail
           TOKEN="${TELEGRAM_BOT_TOKEN}"
           CHATFILE="chat_ids.txt"
-          BLOCKFILE="blocked_chats.txt"
           JSON="/tmp/decoded_results.json"
           SENTLOG="sent_log.txt"
           LOCK="/tmp/sent_log.lock"
-
-          # ensure blocklist exists
-          [ -f "${BLOCKFILE}" ] || echo "# blocked chat ids" > "${BLOCKFILE}"
 
           is_valid_url() { printf '%s' "$1" | grep -E -q '^https?://'; }
 
@@ -183,11 +179,14 @@ jobs:
 
           # load chat ids (ignore comments/blank)
           mapfile -t ALL_CIDS < <(grep -vE '^\s*#|^\s*$' "${CHATFILE}" || true)
+          # sanitize each id (remove CR and trim)
           for i in "${!ALL_CIDS[@]}"; do
             ALL_CIDS[$i]=$(echo "${ALL_CIDS[$i]}" | tr -d '\r' | xargs)
           done
+
           echo "[*] total chat ids to attempt:" "${#ALL_CIDS[@]}"
 
+          # iterate posts
           jq -c '.[]' "${JSON}" | while read -r item; do
             title=$(jq -r '.title // ""'   <<<"$item")
             thumb=$(jq -r '.thumbnail // ""'<<<"$item")
@@ -196,43 +195,37 @@ jobs:
             CAPTION=$(printf "%s\n%s" "$title" "$link")
 
             for cid in "${ALL_CIDS[@]}"; do
-              # sanitize
-              cid="$(echo "$cid" | tr -d '\r' | xargs)"
-              [ -z "$cid" ] && continue
-
-              # skip blocked chats
-              if grep -Fxq "$cid" "${BLOCKFILE}"; then
-                echo "[!] Skipping blocked chat: ${cid}"
-                continue
-              fi
-
-              # skip already sent
-              if grep -Fqx -- "${cid}|${postid}" "${SENTLOG}"; then
-                echo "[*] Already sent to ${cid} -> ${postid}, skipping."
+              # skip empty/comment lines
+              if [[ -z "${cid}" || "${cid}" =~ ^\# ]]; then
                 continue
               fi
 
               echo "[*] Attempt send to: ${cid} (post: ${postid})"
 
               attempts=0
-              max_attempts=2
-              delivered=false
+              max_attempts=3
+              success=false
 
               while [ $attempts -lt $max_attempts ]; do
                 attempts=$((attempts+1))
 
-                # use if ( ... ) so set -e doesn't abort the outer script on non-zero exit
-                if (
+                (
                   flock -x 200
+
+                  # if already logged as sent, skip (use -- to stop grep treating leading '-' as option)
+                  if grep -Fqx -- "${cid}|${postid}" "${SENTLOG}"; then
+                    echo "Already logged as sent, skipping: ${cid} -> ${postid}"
+                    exit 0
+                  fi
 
                   # perform send (photo if thumb valid)
                   if [ -n "$thumb" ] && is_valid_url "$thumb"; then
-                    resp=$(curl -s -m 25 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                    resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
                       -d chat_id="${cid}" \
                       --data-urlencode "photo=${thumb}" \
                       --data-urlencode "caption=${CAPTION}")
                   else
-                    resp=$(curl -s -m 25 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                    resp=$(curl -s -m 30 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
                       -d chat_id="${cid}" \
                       --data-urlencode "text=${CAPTION}")
                   fi
@@ -243,76 +236,61 @@ jobs:
                   desc=$(jq -r '.description // ""' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "")
                   errcode=$(jq -r '.error_code // 0' /tmp/last_send_resp_${cid}.json 2>/dev/null || echo "0")
 
-                  if [ "$ok" = "true" ]; then
+                  if [ "$ok" = "true" ] || [ "$ok" = "True" ]; then
                     echo "${cid}|${postid}" >> "${SENTLOG}"
+                    success=true
+                    echo "[+] Send OK -> ${cid} (post: ${postid})"
                     exit 0
-                  fi
-
-                  # not OK -> decide exit code for outer handler
-                  # transient (retryable)
-                  if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
-                    # transient -> return 1 so outer can retry
-                    exit 1
                   else
-                    # permanent -> return 2 so outer will mark blocked
-                    exit 2
-                  fi
-
-                ) 200>"${LOCK}"; then
-                  # success path
-                  echo "[+] Send OK -> ${cid} (post: ${postid})"
-                  delivered=true
-                  break
-                else
-                  rc=$?
-                  if [ $rc -eq 1 ]; then
-                    echo "[~] Transient failure for ${cid} (attempt ${attempts}/${max_attempts}), will retry after backoff."
-                    # small backoff
-                    sleep $((attempts * 2))
-                    continue
-                  elif [ $rc -eq 2 ]; then
-                    echo "[-] Permanent failure for ${cid} (post: ${postid}). Marking blocked."
-                    # log the API response for debugging
-                    cat /tmp/last_send_resp_${cid}.json || true
-                    # add to blocked list (avoid duplicates)
-                    if ! grep -Fxq "$cid" "${BLOCKFILE}"; then
-                      echo "$cid" >> "${BLOCKFILE}"
-                      echo "[!] Added ${cid} to ${BLOCKFILE}"
+                    echo "[-] Send FAILED -> ${cid} (post: ${postid}) ; reason: ${desc} ; code: ${errcode}"
+                    if [ "${errcode}" = "429" ] || ( [ "${errcode}" -ge 500 ] 2>/dev/null ); then
+                      echo "[~] Transient error, will retry (attempt ${attempts}/${max_attempts})"
+                      exit 1
+                    else
+                      # permanent error — do not retry
+                      exit 2
                     fi
-                    # do not retry further for this cid
-                    break
-                  else
-                    echo "[!] Unexpected rc=${rc} for ${cid}"
-                    break
                   fi
+
+                ) 200>"${LOCK}"
+
+                rc=$?
+                if [ $rc -eq 0 ]; then
+                  success=true
+                  break
+                elif [ $rc -eq 1 ]; then
+                  sleep $((attempts * 2))
+                  continue
+                else
+                  break
                 fi
               done
 
-              if [ "$delivered" != "true" ]; then
-                echo "[*] Did not deliver to ${cid} after ${attempts} attempts."
+              if [ "$success" != "true" ]; then
+                echo "Final: failed to send to ${cid} after ${attempts} attempts. See /tmp/last_send_resp_${cid}.json"
               fi
 
-              # throttle to avoid rate-limit bursts
               sleep 0.6
             done
           done
 
-          # commit changes to sent_log and blocked list if any
-          git add "${SENTLOG}" "${BLOCKFILE}" || true
-          if ! git diff --staged --quiet; then
+          # commit sent_log updates (if any)
+          git add "${SENTLOG}" || true
+          if git diff --staged --quiet; then
+            echo "[*] no new sent_log entries"
+          else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "chore: update sent_log/blocked_chats (auto)" || true
+            git commit -m "chore: update sent_log (auto)" || true
             if [ -n "${PUSH_TOKEN:-}" ]; then
               git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
               git push origin HEAD || true
             else
               git push origin HEAD || true
             fi
-          else
-            echo "[*] no changes in sent_log/blocked_chats"
           fi
         shell: bash
+
       - name: Final status
         run: |
           echo "Workflow finished."
